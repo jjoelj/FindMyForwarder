@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Icon
@@ -32,8 +33,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffold
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -41,7 +44,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -50,11 +55,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import io.github.jjoelj.findmyforwarder.ui.theme.FindMyForwarderTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
+import java.io.IOException
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -75,7 +87,37 @@ class MainActivity : ComponentActivity() {
 @PreviewScreenSizes
 @Composable
 fun FindMyForwarderApp() {
-    var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.HOME) }
+    var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.FRIENDS) }
+    var friendsResetRequest by rememberSaveable { mutableIntStateOf(0) }
+    var dismissedLowBatteryWarning by rememberSaveable { mutableStateOf(false) }
+    val context = LocalContext.current
+    val status by AppStatus.state.collectAsState()
+    val batteryPercent = status.batteryPercent
+    SystemBarsForTheme()
+
+    LaunchedEffect(Unit) {
+        fetchBatteryStatus(context)
+    }
+
+    if (
+        !dismissedLowBatteryWarning &&
+        batteryPercent != null &&
+        batteryPercent < 20 &&
+        status.batteryCharging != true
+    ) {
+        AlertDialog(
+            onDismissRequest = { dismissedLowBatteryWarning = true },
+            title = { Text("iPhone battery low") },
+            text = {
+                Text("The forwarding iPhone is at $batteryPercent% and is not charging.")
+            },
+            confirmButton = {
+                TextButton(onClick = { dismissedLowBatteryWarning = true }) {
+                    Text("OK")
+                }
+            }
+        )
+    }
 
     NavigationSuiteScaffold(
         navigationSuiteItems = {
@@ -90,7 +132,12 @@ fun FindMyForwarderApp() {
                     },
                     label = { Text(it.label) },
                     selected = it == currentDestination,
-                    onClick = { currentDestination = it }
+                    onClick = {
+                        if (it == AppDestinations.FRIENDS && currentDestination == AppDestinations.FRIENDS) {
+                            friendsResetRequest++
+                        }
+                        currentDestination = it
+                    }
                 )
             }
         }
@@ -100,9 +147,27 @@ fun FindMyForwarderApp() {
                 .fillMaxSize()
                 .padding(innerPadding)
             when (currentDestination) {
-                AppDestinations.HOME -> Logs(contentModifier)
+                AppDestinations.FRIENDS -> FriendsScreen(contentModifier, friendsResetRequest)
+                AppDestinations.STATUS -> StatusScreen(contentModifier)
+                AppDestinations.LOGS -> Logs(contentModifier)
                 AppDestinations.SETTINGS -> SettingsScreen(contentModifier)
             }
+        }
+    }
+}
+
+@Composable
+private fun SystemBarsForTheme() {
+    val view = LocalView.current
+    val useDarkIcons = MaterialTheme.colorScheme.background.luminance() > 0.5f
+
+    SideEffect {
+        val window = (view.context as? Activity)?.window ?: return@SideEffect
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        WindowCompat.getInsetsController(window, view).apply {
+            isAppearanceLightStatusBars = useDarkIcons
+            isAppearanceLightNavigationBars = useDarkIcons
         }
     }
 }
@@ -111,14 +176,160 @@ enum class AppDestinations(
     val label: String,
     val icon: Int,
 ) {
-    HOME("Home", R.drawable.home_24px),
+    FRIENDS("Friends", R.drawable.group_24px),
+    STATUS("Status", R.drawable.monitoring_24px),
+    LOGS("Logs", R.drawable.logs_24px),
     SETTINGS("Settings", R.drawable.settings_24px),
+}
+
+@Composable
+fun StatusScreen(modifier: Modifier = Modifier) {
+    val currentLogs by FileLogger.logFlow.collectAsState(initial = FileLogger.getLog())
+    val status by AppStatus.state.collectAsState()
+    val scrollState = rememberScrollState()
+    val context = LocalContext.current
+    val prefs = SharedPreferencesProvider(context)
+
+    LaunchedEffect(currentLogs) {
+        scrollState.scrollTo(scrollState.maxValue)
+    }
+
+    LaunchedEffect(prefs.forwardUrl, prefs.forwardToken) {
+        fetchBatteryStatus(context)
+    }
+
+    Column(
+        modifier = modifier
+            .scrollBar(scrollState, color = MaterialTheme.colorScheme.primary)
+            .verticalScroll(scrollState)
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("Status", style = MaterialTheme.typography.titleLarge)
+        StatusCard(
+            "Forwarding",
+            if (prefs.forwardUrl.isBlank()) "Not configured" else "Configured",
+            prefs.forwardUrl.ifBlank { "Set this in Settings" },
+            good = prefs.forwardUrl.isNotBlank() && prefs.forwardToken.isNotBlank()
+        )
+        StatusCard(
+            "Service",
+            if (status.serviceRunning) "Running" else "Idle",
+            if (status.locationUpdatesActive) "Location updates active" else "No active location updates",
+            state = if (status.serviceRunning) StatusTone.Good else StatusTone.Neutral
+        )
+        StatusCard(
+            "Activity",
+            listOfNotNull(status.currentActivity, status.currentTransition).joinToString(" · ").ifBlank { "No activity yet" },
+            formatStatusTime(status.lastActivityAtMillis),
+            state = if (status.currentActivity != null) StatusTone.Good else StatusTone.Neutral
+        )
+        StatusCard(
+            "Last Location",
+            if (status.lastLocationLat != null && status.lastLocationLon != null) {
+                "%.5f, %.5f".format(status.lastLocationLat, status.lastLocationLon)
+            } else "No location yet",
+            formatStatusTime(status.lastLocationAtMillis),
+            state = if (status.lastLocationLat != null && status.lastLocationLon != null) {
+                StatusTone.Good
+            } else {
+                StatusTone.Neutral
+            }
+        )
+        StatusCard(
+            "Last Upload",
+            when (status.lastPostSucceeded) {
+                true -> "Succeeded"
+                false -> "Failed"
+                null -> "Not sent yet"
+            },
+            listOfNotNull(status.lastPostMessage, formatStatusTime(status.lastPostAtMillis).takeIf { it != "Never" })
+                .joinToString(" · ")
+                .ifBlank { "Waiting for a location update" },
+            state = when (status.lastPostSucceeded) {
+                true -> StatusTone.Good
+                false -> StatusTone.Bad
+                null -> StatusTone.Neutral
+            }
+        )
+        val statusBatteryPercent = status.batteryPercent
+        StatusCard(
+            "iPhone Battery",
+            statusBatteryPercent?.let { "$it%" } ?: "Unknown",
+            listOfNotNull(
+                status.batteryCharging?.let { if (it) "Charging" else "Not charging" },
+                status.batteryExternalPower?.let { if (it) "External power" else "Battery power" },
+                status.batteryMessage,
+                formatStatusTime(status.batteryAtMillis).takeIf { it != "Never" },
+            ).joinToString(" · ").ifBlank { "Waiting for battery status" },
+            state = when {
+                statusBatteryPercent == null -> StatusTone.Neutral
+                statusBatteryPercent < 20 && status.batteryCharging != true -> StatusTone.Bad
+                else -> StatusTone.Good
+            }
+        )
+    }
+}
+
+private val statusClient = OkHttpClient()
+
+data class BatteryStatus(
+    val percent: Int,
+    val charging: Boolean,
+    val externalPower: Boolean,
+)
+
+suspend fun fetchBatteryStatus(context: android.content.Context) {
+    withContext(Dispatchers.IO) {
+        val prefs = SharedPreferencesProvider(context)
+        if (prefs.forwardUrl.isBlank() || prefs.forwardToken.isBlank()) {
+            AppStatus.setBattery(null, null, null, "Endpoint not configured")
+            return@withContext
+        }
+        val url = "${prefs.forwardUrl}/battery".toHttpUrlOrNull()?.newBuilder()
+            ?.addQueryParameter("token", prefs.forwardToken)
+            ?.build()
+        if (url == null) {
+            AppStatus.setBattery(null, null, null, "Invalid endpoint URL")
+            return@withContext
+        }
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("skip_zrok_interstitial", "1")
+            .get()
+            .build()
+        try {
+            statusClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    AppStatus.setBattery(null, null, null, "HTTP ${response.code}")
+                    return@withContext
+                }
+                val battery = parseBatteryStatus(response.body.string())
+                AppStatus.setBattery(battery.percent, battery.charging, battery.externalPower)
+            }
+        } catch (e: Exception) {
+            AppStatus.setBattery(null, null, null, e.message ?: "Battery request failed")
+        }
+    }
+}
+
+fun parseBatteryStatus(body: String): BatteryStatus {
+    val root = JSONObject(body)
+    if (!root.optBoolean("ok")) {
+        throw IOException(root.optString("message").ifBlank { "Battery endpoint failed" })
+    }
+    return BatteryStatus(
+        percent = root.getInt("batteryPercent"),
+        charging = root.optBoolean("charging"),
+        externalPower = root.optBoolean("externalPower"),
+    )
 }
 
 @Composable
 fun Logs(modifier: Modifier = Modifier) {
     val currentLogs by FileLogger.logFlow.collectAsState(initial = FileLogger.getLog())
     val scrollState = rememberScrollState()
+    val logs = remember(currentLogs) { parseLogLines(currentLogs.orEmpty()) }
 
     LaunchedEffect(currentLogs) {
         scrollState.scrollTo(scrollState.maxValue)
@@ -128,16 +339,80 @@ fun Logs(modifier: Modifier = Modifier) {
         modifier = modifier
             .scrollBar(scrollState, color = MaterialTheme.colorScheme.primary)
             .verticalScroll(scrollState)
-            .padding(16.dp)
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Text(
-            text = currentLogs ?: "No logs available.",
-            fontFamily = FontFamily.Monospace,
-            fontSize = 8.sp,
-            lineHeight = 10.sp
-        )
+        Text("Logs", style = MaterialTheme.typography.titleLarge)
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (logs.isEmpty()) {
+                    Text("No logs available.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    logs.asReversed().forEach {
+                        Text(
+                            text = "${it.timestamp}  ${it.message}",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            lineHeight = 12.sp,
+                            color = logColor(it.message)
+                        )
+                    }
+                }
+            }
+        }
     }
 }
+
+data class ParsedLogLine(val timestamp: String, val message: String)
+
+fun parseLogLines(log: String): List<ParsedLogLine> =
+    log.lineSequence()
+        .mapNotNull { line ->
+            val parts = line.split(" — ", limit = 2)
+            if (parts.size == 2) ParsedLogLine(parts[0], parts[1]) else null
+        }
+        .toList()
+
+fun formatStatusTime(millis: Long): String =
+    if (millis <= 0L) "Never" else relativeTime(millis / 1000)
+
+enum class StatusTone { Good, Bad, Neutral }
+
+@Composable
+private fun StatusCard(
+    title: String,
+    value: String,
+    detail: String,
+    good: Boolean? = null,
+    state: StatusTone = good?.let { if (it) StatusTone.Good else StatusTone.Bad } ?: StatusTone.Neutral,
+) {
+    val color = when (state) {
+        StatusTone.Good -> Color(0xFF2E7D32)
+        StatusTone.Bad -> MaterialTheme.colorScheme.error
+        StatusTone.Neutral -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(title, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(value, style = MaterialTheme.typography.titleMedium, color = color)
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun logColor(message: String): Color = when {
+    message.contains("[ERROR]") -> MaterialTheme.colorScheme.error
+    message.contains("[WARNING]") -> Color(0xFFF57C00)
+    message.contains("[INFO]") -> MaterialTheme.colorScheme.onSurfaceVariant
+    else -> MaterialTheme.colorScheme.onSurface
+    }
 
 @Composable
 fun SettingsScreen(modifier: Modifier = Modifier) {
@@ -154,7 +429,7 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             onClick = { resetLocation(context) },
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(text = "Reset to Current Location")
+            Text(text = "Send Current Location")
         }
     }
 }
@@ -245,9 +520,15 @@ fun ForwardingSettings() {
                     Button(
                         onClick = {
                             savedUrl = normalizedUrl ?: return@Button
+                            val previousUrl = prefs.forwardUrl
+                            val previousToken = prefs.forwardToken
                             savedToken = tokenInput.trim()
                             prefs.forwardUrl = savedUrl
                             prefs.forwardToken = savedToken
+                            if (savedUrl != previousUrl || savedToken != previousToken) {
+                                prefs.friendsRefreshTriggeredAtMillis = 0L
+                                prefs.friendRefreshTimes = ""
+                            }
                             urlInput = savedUrl
                             tokenInput = savedToken
                             editing = false
@@ -276,6 +557,9 @@ fun ForwardingSettings() {
                     OutlinedButton(onClick = {
                         prefs.forwardUrl = ""
                         prefs.forwardToken = ""
+                        prefs.friendsCache = ""
+                        prefs.friendsRefreshTriggeredAtMillis = 0L
+                        prefs.friendRefreshTimes = ""
                         savedUrl = ""
                         savedToken = ""
                         urlInput = ""
@@ -315,6 +599,7 @@ fun PermissionsStatus() {
             Manifest.permission.ACTIVITY_RECOGNITION
         ),
         Pair("Location", Manifest.permission.ACCESS_FINE_LOCATION),
+        Pair("Contacts (friend names)", Manifest.permission.READ_CONTACTS),
         Pair(
             "Background Location",
             Manifest.permission.ACCESS_BACKGROUND_LOCATION
