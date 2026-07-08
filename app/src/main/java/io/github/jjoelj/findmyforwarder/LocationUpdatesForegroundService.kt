@@ -70,6 +70,7 @@ class LocationUpdatesForegroundService : Service() {
             override fun onLocationResult(locationResult: LocationResult) {
                 locationResult.lastLocation?.let { location ->
                     FileLogger.i("Location update received: ${location.latitude}, ${location.longitude}")
+                    rememberLastSentLocation(location.latitude, location.longitude)
 
                     serviceScope.launch {
                         postLocation(location.latitude, location.longitude)
@@ -85,12 +86,14 @@ class LocationUpdatesForegroundService : Service() {
             val token = prefs.forwardToken
             if (baseUrl.isBlank() || token.isBlank()) {
                 FileLogger.w("Forwarding endpoint not configured; skipping location post.")
+                AppStatus.setPostResult(false, "Endpoint not configured")
                 return@withContext false
             }
 
             val httpUrl = "$baseUrl/set".toHttpUrlOrNull()
             if (httpUrl == null) {
                 FileLogger.e("Invalid forwarding URL: $baseUrl")
+                AppStatus.setPostResult(false, "Invalid forwarding URL")
                 return@withContext false
             }
 
@@ -108,11 +111,14 @@ class LocationUpdatesForegroundService : Service() {
 
             try {
                 client.newCall(request).execute().use { response ->
-                    FileLogger.i(response.body.string())
+                    val body = response.body.string()
+                    FileLogger.i(body)
+                    AppStatus.setPostResult(response.isSuccessful, "HTTP ${response.code}")
                     response.isSuccessful
                 }
             } catch (e: Exception) {
                 FileLogger.e("Error posting location: ${e.message}")
+                AppStatus.setPostResult(false, e.message)
                 false
             }
         }
@@ -130,11 +136,13 @@ class LocationUpdatesForegroundService : Service() {
 
             if (!isServiceInForeground) {
                 isServiceInForeground = true
+                AppStatus.setServiceRunning(true)
                 FileLogger.i("LocationUpdatesForegroundService started in foreground.")
             }
 
             if (!isActivityRecognitionActive) {
                 isActivityRecognitionActive = true
+                AppStatus.setActivityRecognitionActive(true)
                 ActivityRecognitionProvider(applicationContext).apply {
                     startActivityTransitionRecognitionWithBroadcast()
                 }
@@ -163,6 +171,7 @@ class LocationUpdatesForegroundService : Service() {
                     val currentTransitionName = currentActivity.transitionType.getTransitionName()
                     val event = "Activity: $currentActivityName, Transition: $currentTransitionName"
                     FileLogger.i("Received ACTIVITY_TRANSITION_ACTION - $event")
+                    AppStatus.setActivity(currentActivityName, currentTransitionName)
 
                     notificationProvider.updateNotification(currentActivityName)
 
@@ -176,34 +185,22 @@ class LocationUpdatesForegroundService : Service() {
                                 Looper.getMainLooper()
                             ).addOnFailureListener {
                                 FileLogger.e("Failed to start location updates: ${it.message}")
+                                AppStatus.setLocationUpdatesActive(false)
+                            }.addOnSuccessListener {
+                                AppStatus.setLocationUpdatesActive(true)
                             }
                         } else if (currentActivity.transitionType == ActivityTransition.ACTIVITY_TRANSITION_EXIT) {
                             stopLocationUpdates()
                         }
                     } else if (currentActivity.transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER) {
+                        sendCurrentLocation()
                         stopForeground()
                     }
                 }
 
                 RESET_LOCATION_ACTION -> {
                     FileLogger.i("Received RESET_LOCATION_ACTION")
-                    val currentLocationRequest = CurrentLocationRequest.Builder()
-                        .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
-                        .build()
-                    fusedLocationProviderClient.getCurrentLocation(currentLocationRequest, null)
-                        .addOnSuccessListener { location ->
-                            if (location != null) {
-                                serviceScope.launch {
-                                    postLocation(location.latitude, location.longitude)
-                                }
-                            } else {
-                                FileLogger.w("Current location is null.")
-                            }
-                        }
-                        .addOnFailureListener {
-                            FileLogger.e("Failed to get current location: ${it.message}")
-                        }
-                    stopForeground()
+                    sendCurrentLocation()
                 }
             }
         }
@@ -247,11 +244,40 @@ class LocationUpdatesForegroundService : Service() {
         }
     }
 
+    private fun rememberLastSentLocation(latitude: Double, longitude: Double) {
+        val now = System.currentTimeMillis()
+        prefs.lastSentLat = latitude.toString()
+        prefs.lastSentLon = longitude.toString()
+        prefs.lastSentAtMillis = now
+        AppStatus.setLastLocation(latitude, longitude, now)
+    }
+
+    private fun sendCurrentLocation() {
+        val currentLocationRequest = CurrentLocationRequest.Builder()
+            .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
+            .build()
+        fusedLocationProviderClient.getCurrentLocation(currentLocationRequest, null)
+            .addOnSuccessListener { location ->
+                if (location != null) {
+                    rememberLastSentLocation(location.latitude, location.longitude)
+                    serviceScope.launch {
+                        postLocation(location.latitude, location.longitude)
+                    }
+                } else {
+                    FileLogger.w("Current location is null.")
+                }
+            }
+            .addOnFailureListener {
+                FileLogger.e("Failed to get current location: ${it.message}")
+            }
+    }
+
     private fun stopForeground() {
         stopLocationUpdates()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         isServiceInForeground = false
+        AppStatus.setServiceRunning(false)
     }
 
     private fun stopLocationUpdates() {
@@ -259,6 +285,7 @@ class LocationUpdatesForegroundService : Service() {
             FileLogger.e("Failed to stop location updates: ${it.message}")
         }.addOnSuccessListener {
             FileLogger.i("Location updates stopped successfully.")
+            AppStatus.setLocationUpdatesActive(false)
         }
     }
 

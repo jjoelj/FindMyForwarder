@@ -45,10 +45,12 @@ class ActivityRecognitionProvider(private val context: Context) {
             activityRecognitionClient.requestActivityTransitionUpdates(request, pendingIntent)
                 .addOnFailureListener { e ->
                     FileLogger.e("Failed to start activity transition updates: ${e.message}")
+                    AppStatus.setActivityRecognitionActive(false)
                     continuation.resume(false)
                 }
                 .addOnSuccessListener {
                     FileLogger.i("Successfully started activity transition updates.")
+                    AppStatus.setActivityRecognitionActive(true)
                     continuation.resume(true)
                 }
         }
