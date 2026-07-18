@@ -8,12 +8,15 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -46,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
@@ -71,6 +75,7 @@ import java.io.IOException
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
 
         // Idempotent re-registration; the safety net for lost Play Services registrations.
         startActivityRecognition(this)
@@ -145,8 +150,17 @@ fun FindMyForwarderApp() {
             val contentModifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+            // Map runs full-bleed under the status bar; it draws its own scrim.
+            val layoutDirection = LocalLayoutDirection.current
+            val mapModifier = Modifier
+                .fillMaxSize()
+                .padding(
+                    start = innerPadding.calculateStartPadding(layoutDirection),
+                    end = innerPadding.calculateEndPadding(layoutDirection),
+                    bottom = innerPadding.calculateBottomPadding(),
+                )
             when (currentDestination) {
-                AppDestinations.FRIENDS -> FriendsScreen(contentModifier, friendsResetRequest)
+                AppDestinations.FRIENDS -> FriendsScreen(mapModifier, friendsResetRequest)
                 AppDestinations.STATUS -> StatusScreen(contentModifier)
                 AppDestinations.LOGS -> Logs(contentModifier)
                 AppDestinations.SETTINGS -> SettingsScreen(contentModifier)
@@ -162,8 +176,6 @@ private fun SystemBarsForTheme() {
 
     SideEffect {
         val window = (view.context as? Activity)?.window ?: return@SideEffect
-        window.statusBarColor = android.graphics.Color.TRANSPARENT
-        window.navigationBarColor = android.graphics.Color.TRANSPARENT
         WindowCompat.getInsetsController(window, view).apply {
             isAppearanceLightStatusBars = useDarkIcons
             isAppearanceLightNavigationBars = useDarkIcons
@@ -233,22 +245,6 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                 StatusTone.Good
             } else {
                 StatusTone.Neutral
-            }
-        )
-        StatusCard(
-            "Last Upload",
-            when (status.lastPostSucceeded) {
-                true -> "Succeeded"
-                false -> "Failed"
-                null -> "Not sent yet"
-            },
-            listOfNotNull(status.lastPostMessage, formatStatusTime(status.lastPostAtMillis).takeIf { it != "Never" })
-                .joinToString(" · ")
-                .ifBlank { "Waiting for a location update" },
-            state = when (status.lastPostSucceeded) {
-                true -> StatusTone.Good
-                false -> StatusTone.Bad
-                null -> StatusTone.Neutral
             }
         )
         val statusBatteryPercent = status.batteryPercent
