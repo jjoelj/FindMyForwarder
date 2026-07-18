@@ -13,13 +13,27 @@
         android:background="#141E2C"
         android:contentDescription="Friends map" />
 
+    <TextView
+        android:id="@+id/widget_map_title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="8dp"
+        android:paddingHorizontal="8dp"
+        android:paddingVertical="4dp"
+        android:textSize="12sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:background="@drawable/widget_chip_bg"
+        android:visibility="gone" />
+
     <ImageView
         android:id="@+id/widget_map_refresh"
-        android:layout_width="36dp"
-        android:layout_height="36dp"
-        android:layout_gravity="bottom|end"
-        android:layout_margin="8dp"
-        android:padding="6dp"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="6dp"
+        android:padding="12dp"
         android:src="@drawable/refresh_24px"
         android:tint="#FFFFFF"
         android:background="@drawable/widget_chip_bg"
@@ -39,12 +53,38 @@
         android:background="@drawable/widget_chip_bg"
         android:visibility="gone" />
 
+    <TextView
+        android:id="@+id/widget_map_updated"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="8dp"
+        android:paddingHorizontal="8dp"
+        android:paddingVertical="4dp"
+        android:textSize="11sp"
+        android:textColor="#FFFFFF"
+        android:background="@drawable/widget_chip_bg"
+        android:visibility="gone" />
+
+    <TextView
+        android:id="@+id/widget_map_loading_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="8dp"
+        android:textSize="14sp"
+        android:textColor="#FFFFFF"
+        android:background="@drawable/widget_chip_bg"
+        android:visibility="gone" />
+
     <ProgressBar
         android:id="@+id/widget_map_progress"
         android:layout_width="24dp"
         android:layout_height="24dp"
-        android:layout_gravity="bottom|end"
-        android:layout_margin="14dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="18dp"
+        android:visibility="gone"
         android:indeterminate="true" />
 
 </FrameLayout>

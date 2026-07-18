@@ -43,6 +43,10 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsTopHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -79,6 +83,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.toArgb
@@ -319,6 +324,7 @@ suspend fun fetchFriends(context: Context, handle: String? = null): List<Friend>
         val friends = parseFriends(body)
         if (handle == null) {
             prefs.friendsCache = body
+            prefs.lastFriendsUpdatedAtMillis = System.currentTimeMillis()
             MapWidget.requestUpdate(context)
         }
         FileLogger.i(
@@ -353,6 +359,7 @@ suspend fun refreshFriends(context: Context, handle: String? = null): List<Frien
         val friends = parseFriends(body)
         if (handle == null) {
             prefs.friendsCache = body
+            prefs.lastFriendsUpdatedAtMillis = System.currentTimeMillis()
             MapWidget.requestUpdate(context)
         }
         val target = handle ?: "all friends"
@@ -670,6 +677,22 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
             mapCenterOffsetY = mapCenterOffset.value.roundToInt(),
             onFriendSelected = { selectFriend(it) },
             modifier = Modifier.fillMaxSize()
+        )
+
+        // Soft scrim behind the status bar so its icons stay legible over the map.
+        Spacer(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+                .windowInsetsTopHeight(WindowInsets.statusBars)
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            MaterialTheme.colorScheme.background.copy(alpha = 0.85f),
+                            MaterialTheme.colorScheme.background.copy(alpha = 0f),
+                        )
+                    )
+                )
         )
 
         AnimatedVisibility(
@@ -1342,7 +1365,7 @@ fun friendPhotoMarkerIcon(
     )
 }
 
-private fun selectedFriendMarkerIcon(
+fun selectedFriendMarkerIcon(
     context: Context,
     friend: Friend,
     markerColor: Int,

@@ -112,6 +112,7 @@ class LocationUpdatesForegroundService : Service() {
                     AppStatus.setPostResult(response.isSuccessful, "HTTP ${response.code}")
                     if (response.isSuccessful) {
                         prefs.lastPushedAtMillis = System.currentTimeMillis()
+                        notificationProvider.updateNotification(prefs.lastActivityName)
                     }
                     response.isSuccessful
                 }

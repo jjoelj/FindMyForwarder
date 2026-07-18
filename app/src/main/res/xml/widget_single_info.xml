@@ -8,4 +8,5 @@
     android:updatePeriodMillis="1800000"
     android:widgetCategory="home_screen"
     android:configure="io.github.jjoelj.findmyforwarder.SingleFriendWidgetConfigActivity"
+    android:widgetFeatures="reconfigurable"
     android:initialLayout="@layout/widget_map" />

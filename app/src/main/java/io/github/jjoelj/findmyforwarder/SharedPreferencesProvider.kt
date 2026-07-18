@@ -11,11 +11,13 @@ class SharedPreferencesProvider(context: Context) {
         const val PREFS_KEY_FORWARD_TOKEN = "forward_token"
         const val PREFS_KEY_FRIENDS_CACHE = "friends_cache"
         const val PREFS_KEY_LAST_PUSHED_AT = "last_pushed_at"
+        const val PREFS_KEY_LAST_FRIENDS_UPDATED_AT = "last_friends_updated_at"
         const val PREFS_KEY_LAST_SENT_LAT = "last_sent_lat"
         const val PREFS_KEY_LAST_SENT_LON = "last_sent_lon"
         const val PREFS_KEY_LAST_SENT_AT = "last_sent_at"
         const val PREFS_KEY_IS_FORWARDING_ENABLED = "is_forwarding_enabled"
         const val PREFS_KEY_LAST_ACTIVITY_NAME = "last_activity_name"
+        const val DEFAULT_NEARBY_RADIUS_MILES = 25
     }
 
     private val sharedPreferences: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
@@ -49,6 +51,11 @@ class SharedPreferencesProvider(context: Context) {
         get() = sharedPreferences.getLong(PREFS_KEY_LAST_PUSHED_AT, 0L)
         set(value) = sharedPreferences.edit { putLong(PREFS_KEY_LAST_PUSHED_AT, value) }
 
+    /** When the cached friend locations were last successfully fetched from the server. */
+    var lastFriendsUpdatedAtMillis: Long
+        get() = sharedPreferences.getLong(PREFS_KEY_LAST_FRIENDS_UPDATED_AT, 0L)
+        set(value) = sharedPreferences.edit { putLong(PREFS_KEY_LAST_FRIENDS_UPDATED_AT, value) }
+
     var lastActivityName: String?
         get() = sharedPreferences.getString(PREFS_KEY_LAST_ACTIVITY_NAME, null)
         set(value) = sharedPreferences.edit { putString(PREFS_KEY_LAST_ACTIVITY_NAME, value) }
@@ -60,6 +67,15 @@ class SharedPreferencesProvider(context: Context) {
     fun setWidgetFriendHandle(widgetId: Int, handle: String?) = sharedPreferences.edit {
         if (handle == null) remove("widget_friend_$widgetId")
         else putString("widget_friend_$widgetId", handle)
+    }
+
+    /** Nearby radius, in miles, selected for a particular Nearby widget instance. */
+    fun nearbyWidgetRadiusMiles(widgetId: Int): Int =
+        sharedPreferences.getInt("nearby_radius_miles_$widgetId", DEFAULT_NEARBY_RADIUS_MILES)
+
+    fun setNearbyWidgetRadiusMiles(widgetId: Int, miles: Int?) = sharedPreferences.edit {
+        if (miles == null) remove("nearby_radius_miles_$widgetId")
+        else putInt("nearby_radius_miles_$widgetId", miles)
     }
 
     var isForwardingEnabled: Boolean

@@ -7,8 +7,10 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.text.format.DateFormat
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
+import java.util.Date
 
 class NotificationProvider(private val context: Context) {
 
@@ -28,9 +30,16 @@ class NotificationProvider(private val context: Context) {
             pendingIntentFlags
         )
 
+        val lastUploaded = SharedPreferencesProvider(context).lastPushedAtMillis.takeIf { it > 0L }
+            ?.let { DateFormat.getTimeFormat(context).format(Date(it)) }
+            ?: "Never"
+        val activityText = "Detected Activity: ${activityName ?: "Unknown"}"
+        val uploadText = "Last uploaded: $lastUploaded"
         val notification = NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Find My Forwarder")
-            .setContentText("Detected Activity: ${activityName ?: "Unknown"}")
+            .setContentText(activityText)
+            .setSubText(uploadText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$activityText\n$uploadText"))
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
