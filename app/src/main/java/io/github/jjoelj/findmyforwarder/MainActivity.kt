@@ -72,9 +72,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (!LocationUpdatesForegroundService.isRunning()) {
-            startActivityRecognition(this)
-        }
+        // Idempotent re-registration; the safety net for lost Play Services registrations.
+        startActivityRecognition(this)
 
         setContent {
             FindMyForwarderTheme {
@@ -351,7 +350,7 @@ fun Logs(modifier: Modifier = Modifier) {
                 if (logs.isEmpty()) {
                     Text("No logs available.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
-                    logs.asReversed().forEach {
+                    logs.forEach {
                         Text(
                             text = "${it.timestamp}  ${it.message}",
                             fontFamily = FontFamily.Monospace,
@@ -526,8 +525,7 @@ fun ForwardingSettings() {
                             prefs.forwardUrl = savedUrl
                             prefs.forwardToken = savedToken
                             if (savedUrl != previousUrl || savedToken != previousToken) {
-                                prefs.friendsRefreshTriggeredAtMillis = 0L
-                                prefs.friendRefreshTimes = ""
+                                prefs.friendsCache = ""
                             }
                             urlInput = savedUrl
                             tokenInput = savedToken
@@ -558,8 +556,6 @@ fun ForwardingSettings() {
                         prefs.forwardUrl = ""
                         prefs.forwardToken = ""
                         prefs.friendsCache = ""
-                        prefs.friendsRefreshTriggeredAtMillis = 0L
-                        prefs.friendRefreshTimes = ""
                         savedUrl = ""
                         savedToken = ""
                         urlInput = ""

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_rounded_bg"
+    android:clipToOutline="true">
+
+    <ImageView
+        android:id="@+id/widget_map_image"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:background="#141E2C"
+        android:contentDescription="Friends map" />
+
+    <ImageView
+        android:id="@+id/widget_map_refresh"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="8dp"
+        android:padding="6dp"
+        android:src="@drawable/refresh_24px"
+        android:tint="#FFFFFF"
+        android:background="@drawable/widget_chip_bg"
+        android:visibility="gone"
+        android:contentDescription="Refresh" />
+
+    <TextView
+        android:id="@+id/widget_map_status"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|start"
+        android:layout_margin="8dp"
+        android:paddingHorizontal="8dp"
+        android:paddingVertical="4dp"
+        android:textSize="11sp"
+        android:textColor="#FFFFFF"
+        android:background="@drawable/widget_chip_bg"
+        android:visibility="gone" />
+
+    <ProgressBar
+        android:id="@+id/widget_map_progress"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="14dp"
+        android:indeterminate="true" />
+
+</FrameLayout>

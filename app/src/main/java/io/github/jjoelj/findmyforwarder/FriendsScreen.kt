@@ -10,9 +10,13 @@ import android.graphics.Canvas as AndroidCanvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Point
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
 import android.location.Location
+import android.os.SystemClock
+import android.view.MotionEvent
 import android.net.Uri
 import android.provider.ContactsContract
 import android.text.format.DateUtils
@@ -70,7 +74,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -82,15 +85,16 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -99,22 +103,43 @@ import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.osmdroid.events.MapListener
-import org.osmdroid.events.ScrollEvent
-import org.osmdroid.events.ZoomEvent
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
-import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Overlay
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlin.math.absoluteValue
+import kotlin.math.atan2
+import kotlin.math.hypot
+import kotlin.math.sin
+import kotlin.math.PI
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 private const val MAP_ANIMATION_DURATION_MS = 450L
+
+// ponytail: span cap approximates "what fits on screen at a useful zoom"; derive from
+// screen size + zoom math if this feels wrong on tablets
+private const val MAX_FIT_SPAN_DEGREES = 60.0
+
+private const val EDGE_AVATAR_MIN_SIZE_PX = 48
+
+// Margin leaves room for the direction arrow drawn outside the avatar.
+private const val EDGE_AVATAR_MARGIN_PX = 28
+private const val EDGE_ARROW_LENGTH_PX = 22f
+
+// Translucent so edge hints don't read as actual positions on the map.
+private const val EDGE_INDICATOR_MAX_ALPHA = 170
+
+private const val MY_LOCATION_PULSE_MS = 2000L
 private const val SHEET_FLING_VELOCITY_THRESHOLD = 900f
-private const val ACTIVE_FRIEND_REFRESH_MIN_INTERVAL_MILLIS = 15_000L
+private const val FRIENDS_LIST_POLL_INTERVAL_MILLIS = 60_000L
+private const val FRIENDS_AUTO_REFRESH_DELAY_MILLIS = 10_000L
+private const val ACTIVE_FRIEND_FETCH_INTERVAL_MILLIS = 15_000L
 
 data class Friend(
     val handle: String,
@@ -235,7 +260,7 @@ fun formatMiles(from: Location, lat: Double, lon: Double): String {
     }
 }
 
-// The phone live-refreshes from Find My on each call; spec allows up to ~20s.
+// The iPhone refreshes its cache independently; /friends returns the latest server cache.
 private val friendsClient = OkHttpClient.Builder()
     .readTimeout(25, TimeUnit.SECONDS)
     .callTimeout(30, TimeUnit.SECONDS)
@@ -246,49 +271,16 @@ private val friendsRefreshClient = OkHttpClient.Builder()
     .callTimeout(50, TimeUnit.SECONDS)
     .build()
 
-const val FRIENDS_REFRESH_INTERVAL_MILLIS = 120_000L
-private const val ALL_FRIENDS_REFRESH_INTERVAL_MILLIS = 15 * 60 * 1_000L
-
-fun shouldRefreshFriendsLocations(
-    nowMillis: Long,
-    lastRefreshTriggeredAtMillis: Long,
-    intervalMillis: Long = FRIENDS_REFRESH_INTERVAL_MILLIS,
-): Boolean =
-    lastRefreshTriggeredAtMillis <= 0 ||
-            nowMillis - lastRefreshTriggeredAtMillis >= intervalMillis
-
-fun friendHandlesToRefresh(friends: List<Friend>): List<String> =
-    friends.sortedWith(compareBy<Friend>({ it.timestamp }, { it.handle }))
-        .map { it.handle }
-        .distinct()
-
-fun parseFriendRefreshTimes(body: String): Map<String, Long> {
-    if (body.isBlank()) return emptyMap()
-    return try {
-        val root = JSONObject(body)
-        root.keys().asSequence().associateWith { root.optLong(it) }
-    } catch (_: Exception) {
-        emptyMap()
+private fun friendsUrl(
+    prefs: SharedPreferencesProvider,
+    path: String,
+    handle: String? = null,
+) = "${prefs.forwardUrl}$path".toHttpUrlOrNull()?.newBuilder()
+    ?.addQueryParameter("token", prefs.forwardToken)
+    ?.apply {
+        if (!handle.isNullOrBlank()) addQueryParameter("handle", handle)
     }
-}
-
-fun encodeFriendRefreshTimes(times: Map<String, Long>): String {
-    val root = JSONObject()
-    times.forEach { (handle, time) -> root.put(handle, time) }
-    return root.toString()
-}
-
-fun friendWasRefreshedRecently(
-    handle: String,
-    refreshTimes: Map<String, Long>,
-    nowMillis: Long,
-    intervalMillis: Long = FRIENDS_REFRESH_INTERVAL_MILLIS,
-): Boolean =
-    !shouldRefreshFriendsLocations(
-        nowMillis = nowMillis,
-        lastRefreshTriggeredAtMillis = refreshTimes[normalizeHandle(handle)] ?: 0L,
-        intervalMillis = intervalMillis,
-    )
+    ?.build()
 
 fun refreshFailureMessage(body: String): String? {
     if (body.isBlank()) return null
@@ -306,134 +298,10 @@ fun refreshFailureMessage(body: String): String? {
     }
 }
 
-fun mergeRefreshedFriends(current: List<Friend>, refreshed: List<Friend>): List<Friend> {
-    if (refreshed.isEmpty()) return current
-    val byHandle = refreshed.associateBy { normalizeHandle(it.handle) }
-    val replaced = current.map { friend ->
-        val updated = byHandle[normalizeHandle(friend.handle)] ?: return@map friend
-        updated.copy(
-            name = updated.name ?: friend.name,
-            photoUri = updated.photoUri ?: friend.photoUri,
-        )
-    }
-    val existingHandles = current.map { normalizeHandle(it.handle) }.toSet()
-    return replaced + refreshed.filter { normalizeHandle(it.handle) !in existingHandles }
-}
-
-private fun friendsUrl(
-    prefs: SharedPreferencesProvider,
-    path: String,
-    handle: String? = null,
-) = "${prefs.forwardUrl}$path".toHttpUrlOrNull()?.newBuilder()
-    ?.addQueryParameter("token", prefs.forwardToken)
-    ?.apply {
-        if (!handle.isNullOrBlank()) addQueryParameter("handle", handle)
-    }
-    ?.build()
-
-private fun triggerFriendsRefreshIfStale(
-    prefs: SharedPreferencesProvider,
-    handle: String?,
-): List<Friend> {
-    val url = friendsUrl(prefs, "/friends/refresh", handle)
-        ?: throw IOException("Invalid base URL; check Settings")
-    val request = Request.Builder()
-        .url(url)
-        .addHeader("skip_zrok_interstitial", "1")
-        .get()
-        .build()
-
-    try {
-        friendsRefreshClient.newCall(request).execute().use { response ->
-            when {
-                response.isSuccessful -> {
-                    val body = response.body.string()
-                    val failure = refreshFailureMessage(body)
-                    if (failure == null) {
-                        val target = handle ?: "all friends"
-                        FileLogger.i("Triggered friends location refresh for $target")
-                        return parseFriends(body)
-                    } else {
-                        FileLogger.w("Friends location refresh trigger failed: $failure")
-                    }
-                }
-
-                response.code == 409 -> {
-                    FileLogger.i("Friends location refresh already in progress")
-                }
-
-                else -> {
-                    FileLogger.w("Friends location refresh trigger failed: HTTP ${response.code}")
-                }
-            }
-        }
-    } catch (e: Exception) {
-        FileLogger.w("Friends location refresh trigger did not complete: ${e.message}")
-    }
-    return emptyList()
-}
-
-suspend fun refreshAllFriendsIfStale(context: Context): List<Friend> =
-    withContext(Dispatchers.IO) {
-        val prefs = SharedPreferencesProvider(context)
-        val nowMillis = System.currentTimeMillis()
-        if (!shouldRefreshFriendsLocations(
-                nowMillis = nowMillis,
-                lastRefreshTriggeredAtMillis = prefs.friendsRefreshTriggeredAtMillis,
-                intervalMillis = ALL_FRIENDS_REFRESH_INTERVAL_MILLIS,
-            )
-        ) {
-            return@withContext emptyList()
-        }
-
-        val refreshed = triggerFriendsRefreshIfStale(prefs, handle = null)
-        prefs.friendsRefreshTriggeredAtMillis = nowMillis
-        if (refreshed.isEmpty()) {
-            emptyList()
-        } else {
-            val times = parseFriendRefreshTimes(prefs.friendRefreshTimes).toMutableMap()
-            refreshed.forEach { times[normalizeHandle(it.handle)] = nowMillis }
-            prefs.friendRefreshTimes = encodeFriendRefreshTimes(times)
-            resolveAndDedupe(context, refreshed)
-        }
-    }
-
-suspend fun refreshFriendLocationIfStale(
-    context: Context,
-    friend: Friend,
-    force: Boolean = false,
-    onHandleRefreshing: (String, Boolean) -> Unit = { _, _ -> },
-): List<Friend> {
-    val handle = friend.handle
-    val prefs = SharedPreferencesProvider(context)
-    val nowMillis = System.currentTimeMillis()
-    val refreshTimes = parseFriendRefreshTimes(prefs.friendRefreshTimes)
-    if (!force && friendWasRefreshedRecently(handle, refreshTimes, nowMillis)) {
-        return emptyList()
-    }
-
-    onHandleRefreshing(handle, true)
-    return try {
-        withContext(Dispatchers.IO) {
-            val refreshedFriends = triggerFriendsRefreshIfStale(prefs, handle)
-            val updatedTimes = refreshTimes.toMutableMap()
-            updatedTimes[normalizeHandle(handle)] = nowMillis
-            prefs.friendRefreshTimes = encodeFriendRefreshTimes(updatedTimes)
-            if (refreshedFriends.isEmpty()) {
-                emptyList()
-            } else {
-                resolveAndDedupe(context, refreshedFriends)
-            }
-        }
-    } finally {
-        onHandleRefreshing(handle, false)
-    }
-}
-
-suspend fun fetchFriends(context: Context): List<Friend> = withContext(Dispatchers.IO) {
+suspend fun fetchFriends(context: Context, handle: String? = null): List<Friend> = withContext(Dispatchers.IO) {
     val prefs = SharedPreferencesProvider(context)
 
-    val url = friendsUrl(prefs, "/friends")
+    val url = friendsUrl(prefs, "/friends", handle)
         ?: throw IOException("Invalid base URL; check Settings")
 
     val request = Request.Builder()
@@ -449,9 +317,47 @@ suspend fun fetchFriends(context: Context): List<Friend> = withContext(Dispatche
         }
         val body = response.body.string()
         val friends = parseFriends(body)
-        prefs.friendsCache = body
+        if (handle == null) {
+            prefs.friendsCache = body
+            MapWidget.requestUpdate(context)
+        }
         FileLogger.i(
             "Fetched ${friends.size} friends (${friends.count { it.hasLocation }} with location)"
+        )
+        resolveAndDedupe(context, friends)
+    }
+}
+
+suspend fun refreshFriends(context: Context, handle: String? = null): List<Friend> = withContext(Dispatchers.IO) {
+    val prefs = SharedPreferencesProvider(context)
+
+    val url = friendsUrl(prefs, "/friends/refresh", handle)
+        ?: throw IOException("Invalid base URL; check Settings")
+
+    val request = Request.Builder()
+        .url(url)
+        .addHeader("skip_zrok_interstitial", "1")
+        .get()
+        .build()
+
+    friendsRefreshClient.newCall(request).execute().use { response ->
+        if (response.code == 403) throw IOException("Invalid token")
+        if (response.code == 409) {
+            FileLogger.i("Friends location refresh already in progress")
+            return@withContext emptyList()
+        }
+        if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+
+        val body = response.body.string()
+        refreshFailureMessage(body)?.let { throw IOException(it) }
+        val friends = parseFriends(body)
+        if (handle == null) {
+            prefs.friendsCache = body
+            MapWidget.requestUpdate(context)
+        }
+        val target = handle ?: "all friends"
+        FileLogger.i(
+            "Refreshed $target (${friends.size} friends, ${friends.count { it.hasLocation }} with location)"
         )
         resolveAndDedupe(context, friends)
     }
@@ -497,8 +403,13 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
     var mapSelectionRequest by remember { mutableStateOf(0) }
     var mapSheetSnapRequest by remember { mutableStateOf(0) }
     var mapMyLocationRequest by remember { mutableStateOf(0) }
+    var mapFitAllRequest by remember { mutableStateOf(0) }
+    var refreshedThisVisit by remember { mutableStateOf(false) }
     val refreshingHandles = remember { mutableStateMapOf<String, Boolean>() }
     val status by AppStatus.state.collectAsState()
+    // Prefs hold the durable "last successful push" time; the status flow just
+    // triggers a re-read whenever a new post completes.
+    val lastPushedAtMillis = remember(status.lastPostAtMillis) { prefs.lastPushedAtMillis }
     val myLocation = remember(status.lastLocationLat, status.lastLocationLon) {
         val lat = status.lastLocationLat
         val lon = status.lastLocationLon
@@ -512,24 +423,69 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         }
     }
 
-    fun refresh() {
+    // No last known location: have the service fetch one now, which also stores
+    // it (prefs + AppStatus) and forwards it.
+    LaunchedEffect(Unit) {
+        if (myLocation == null) resetLocation(context)
+    }
+
+    fun applyFetchedFriends(fetchedFriends: List<Friend>) {
+        friends = fetchedFriends
+        loadedOnce = true
+        val selected = selectedFriend ?: return
+        val normalizedHandle = normalizeHandle(selected.handle)
+        fetchedFriends.firstOrNull { normalizeHandle(it.handle) == normalizedHandle }?.let { updated ->
+            selectedFriend = updated.copy(
+                name = updated.name ?: selected.name,
+                photoUri = updated.photoUri ?: selected.photoUri,
+            )
+        }
+    }
+
+    fun loadFriends(forceRefresh: Boolean) {
         if (!configured || loading) return
+        if (forceRefresh) refreshedThisVisit = true
         scope.launch {
             loading = true
             error = null
             try {
-                val refreshedAll = refreshAllFriendsIfStale(context)
-                if (refreshedAll.isNotEmpty()) {
-                    friends = mergeRefreshedFriends(friends, refreshedAll)
+                val fetchedFriends = if (forceRefresh) {
+                    refreshFriends(context).ifEmpty { fetchFriends(context) }
+                } else {
+                    fetchFriends(context)
                 }
-                val fetchedFriends = fetchFriends(context)
-                friends = fetchedFriends
-                loadedOnce = true
+                applyFetchedFriends(fetchedFriends)
             } catch (e: Exception) {
                 error = e.message ?: "Unknown error"
                 FileLogger.e("Failed to fetch friends: ${e.message}")
             } finally {
                 loading = false
+            }
+        }
+    }
+
+    fun refresh() {
+        loadFriends(forceRefresh = true)
+    }
+
+    // Poll only while this screen is actually visible; leaving the tab cancels the
+    // effect and backgrounding the app suspends it via repeatOnLifecycle.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(configured, lifecycleOwner) {
+        if (!configured) return@LaunchedEffect
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            launch {
+                delay(FRIENDS_AUTO_REFRESH_DELAY_MILLIS)
+                if (!refreshedThisVisit) refresh()
+            }
+            while (isActive) {
+                delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS)
+                if (loading) continue
+                try {
+                    applyFetchedFriends(fetchFriends(context))
+                } catch (e: Exception) {
+                    FileLogger.w("Friends list poll failed: ${e.message}")
+                }
             }
         }
     }
@@ -544,7 +500,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
     val contactsLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
             contactsGranted = it
-            if (it) refresh()
+            if (it) loadFriends(forceRefresh = false)
         }
 
     LaunchedEffect(Unit) {
@@ -557,10 +513,9 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
 
     // New observers get brought up to the current state, so this fires on first
     // composition, on switching back to this tab, and on returning to the app.
-    val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) refresh()
+            if (event == Lifecycle.Event.ON_RESUME) loadFriends(forceRefresh = false)
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
@@ -589,8 +544,10 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         val sheetAnchors = remember(sheetMaxHeightPx, collapsedOffset) {
             listOf(fullOffset, twoThirdOffset, halfOffset, collapsedOffset)
         }
+        // Visible from the half position all the way down to collapsed; only a
+        // taller sheet (which covers the map) hides them.
         val showMyLocationButton = myLocation != null &&
-            (sheetOffset.value - halfOffset).absoluteValue < with(density) { 3.dp.toPx() }
+            sheetOffset.value > halfOffset - with(density) { 3.dp.toPx() }
         fun updateMapSheetHeight(offset: Float) {
             mapSheetVisibleHeightPx = sheetMaxHeightPx - offset
             mapSheetSnapRequest++
@@ -617,17 +574,6 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                 else -> sheetAnchors.minBy { (sheetOffset.value - it).absoluteValue }
             }
             animateSheetTo(target)
-        }
-        fun applyRefreshedFriends(refreshed: List<Friend>) {
-            if (refreshed.isEmpty()) return
-            friends = mergeRefreshedFriends(friends, refreshed)
-            selectedFriend?.let { selected ->
-                val updatedSelected = mergeRefreshedFriends(listOf(selected), refreshed).first()
-                if (updatedSelected.lat != selected.lat || updatedSelected.lon != selected.lon) {
-                    mapSelectionRequest++
-                }
-                selectedFriend = updatedSelected
-            }
         }
         fun selectFriend(friend: Friend) {
             selectedFriend = friend
@@ -659,33 +605,55 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
             }
         }
 
-        val currentSelectedFriend by rememberUpdatedState(selectedFriend)
         LaunchedEffect(selectedFriend?.handle) {
             val selectedHandle = selectedFriend?.handle ?: return@LaunchedEffect
             val normalizedHandle = normalizeHandle(selectedHandle)
-            while (isActive) {
-                val activeFriend = currentSelectedFriend
-                if (activeFriend == null || normalizeHandle(activeFriend.handle) != normalizedHandle) {
-                    break
-                }
-                val refreshStartedAt = System.currentTimeMillis()
-                val refreshed = refreshFriendLocationIfStale(
-                    context = context,
-                    friend = activeFriend,
-                    force = true,
-                    onHandleRefreshing = { handle, refreshing ->
-                        if (refreshing) {
-                            refreshingHandles[handle] = true
-                        } else {
-                            refreshingHandles.remove(handle)
+            lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                while (isActive) {
+                    val fetchStartedAt = System.currentTimeMillis()
+                    refreshingHandles[selectedHandle] = true
+                    try {
+                        val fetchedFriends = refreshFriends(context, handle = selectedHandle)
+                            .ifEmpty { fetchFriends(context, handle = selectedHandle) }
+                        fetchedFriends.firstOrNull { normalizeHandle(it.handle) == normalizedHandle }?.let { updated ->
+                            val current = selectedFriend
+                            if (current == null || normalizeHandle(current.handle) != normalizedHandle) {
+                                return@let
+                            }
+                            val updatedWithMetadata = updated.copy(
+                                name = updated.name ?: current.name,
+                                photoUri = updated.photoUri ?: current.photoUri,
+                            )
+                            if (updatedWithMetadata.lat != current.lat || updatedWithMetadata.lon != current.lon) {
+                                mapSelectionRequest++
+                            }
+                            selectedFriend = updatedWithMetadata
+                            var replaced = false
+                            friends = friends.map { friend ->
+                                if (normalizeHandle(friend.handle) != normalizedHandle) {
+                                    friend
+                                } else {
+                                    replaced = true
+                                    updatedWithMetadata.copy(
+                                        name = updatedWithMetadata.name ?: friend.name,
+                                        photoUri = updatedWithMetadata.photoUri ?: friend.photoUri,
+                                    )
+                                }
+                            }
+                            if (!replaced) {
+                                friends = friends + updatedWithMetadata
+                            }
                         }
+                    } catch (e: Exception) {
+                        FileLogger.w("Failed to update selected friend from cache: ${e.message}")
+                    } finally {
+                        refreshingHandles.remove(selectedHandle)
                     }
-                )
-                applyRefreshedFriends(refreshed)
-                val elapsedMillis = System.currentTimeMillis() - refreshStartedAt
-                val remainingDelay = ACTIVE_FRIEND_REFRESH_MIN_INTERVAL_MILLIS - elapsedMillis
-                if (remainingDelay > 0) {
-                    delay(remainingDelay)
+                    val elapsedMillis = System.currentTimeMillis() - fetchStartedAt
+                    val remainingDelay = ACTIVE_FRIEND_FETCH_INTERVAL_MILLIS - elapsedMillis
+                    if (remainingDelay > 0) {
+                        delay(remainingDelay)
+                    }
                 }
             }
         }
@@ -697,6 +665,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
             selectionRequest = mapSelectionRequest,
             sheetSnapRequest = mapSheetSnapRequest,
             myLocationRequest = mapMyLocationRequest,
+            fitAllRequest = mapFitAllRequest,
             sheetVisibleHeightPx = mapSheetVisibleHeightPx,
             mapCenterOffsetY = mapCenterOffset.value.roundToInt(),
             onFriendSelected = { selectFriend(it) },
@@ -711,27 +680,52 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                 .align(Alignment.BottomStart)
                 .padding(
                     start = 12.dp,
-                    bottom = with(density) { (sheetMaxHeightPx - halfOffset).toDp() } + 12.dp
+                    // Ride just above the sheet's current top edge.
+                    bottom = with(density) {
+                        (sheetMaxHeightPx - sheetOffset.value).coerceAtLeast(0f).toDp()
+                    } + 12.dp
                 )
         ) {
-            Surface(
-                modifier = Modifier
-                    .size(48.dp),
-                shape = RoundedCornerShape(16.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.86f),
-                tonalElevation = 4.dp,
-                shadowElevation = 4.dp,
-            ) {
-                IconButton(
-                    onClick = {
-                        clearSelection(keepSheetPosition = true)
-                        mapMyLocationRequest++
-                    }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Surface(
+                    modifier = Modifier
+                        .size(48.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.86f),
+                    tonalElevation = 4.dp,
+                    shadowElevation = 4.dp,
                 ) {
-                    Icon(
-                        painterResource(R.drawable.navigation_24px),
-                        contentDescription = "Show my location"
-                    )
+                    IconButton(
+                        onClick = {
+                            clearSelection(keepSheetPosition = true)
+                            mapFitAllRequest++
+                        }
+                    ) {
+                        Icon(
+                            painterResource(R.drawable.zoom_out_map_24px),
+                            contentDescription = "Show everyone"
+                        )
+                    }
+                }
+                Surface(
+                    modifier = Modifier
+                        .size(48.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.86f),
+                    tonalElevation = 4.dp,
+                    shadowElevation = 4.dp,
+                ) {
+                    IconButton(
+                        onClick = {
+                            clearSelection(keepSheetPosition = true)
+                            mapMyLocationRequest++
+                        }
+                    ) {
+                        Icon(
+                            painterResource(R.drawable.navigation_24px),
+                            contentDescription = "Show my location"
+                        )
+                    }
                 }
             }
         }
@@ -745,6 +739,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
             friends = sortedFriends,
             selectedFriend = selectedFriend,
             myLocation = myLocation,
+            lastPushedAtMillis = lastPushedAtMillis,
             refreshingHandles = refreshingHandles,
             hiddenBottomPaddingPx = sheetOffset.value,
             onRefresh = { refresh() },
@@ -777,6 +772,7 @@ private fun FriendsMap(
     selectionRequest: Int,
     sheetSnapRequest: Int,
     myLocationRequest: Int,
+    fitAllRequest: Int,
     sheetVisibleHeightPx: Float,
     mapCenterOffsetY: Int,
     onFriendSelected: (Friend) -> Unit,
@@ -785,15 +781,11 @@ private fun FriendsMap(
     val context = LocalContext.current
     val markerColor = Color.rgb(20, 30, 44)
     val markerTextColor = Color.rgb(134, 166, 190)
-    val meMarkerColor = MaterialTheme.colorScheme.tertiary.toArgb()
-    val meMarkerInnerColor = MaterialTheme.colorScheme.onTertiary.toArgb()
     val mapController = remember {
         FriendsMapController(
             context.applicationContext,
             markerColor,
             markerTextColor,
-            meMarkerColor,
-            meMarkerInnerColor,
         )
     }
 
@@ -822,6 +814,7 @@ private fun FriendsMap(
                 selectionRequest = selectionRequest,
                 sheetSnapRequest = sheetSnapRequest,
                 myLocationRequest = myLocationRequest,
+                fitAllRequest = fitAllRequest,
                 sheetVisibleHeightPx = sheetVisibleHeightPx,
                 mapCenterOffsetY = mapCenterOffsetY,
                 onFriendSelected = onFriendSelected,
@@ -834,22 +827,30 @@ private class FriendsMapController(
     private val context: Context,
     private val markerColor: Int,
     private val markerTextColor: Int,
-    private val meMarkerColor: Int,
-    private val meMarkerInnerColor: Int,
 ) {
-    private val friendMarkers = mutableMapOf<String, Marker>()
     private val friendsByHandle = mutableMapOf<String, Friend>()
     private val friendIconCache = mutableMapOf<String, BitmapDrawable>()
-    private var myLocationMarker: Marker? = null
-    private var zoomedIcons = false
+    private var myLocation: Location? = null
     private var lastFriendSignature = ""
     private var lastSelectedHandle: String? = null
     private var lastSelectionRequest = -1
     private var lastSheetSnapRequest = -1
     private var lastMyLocationRequest = -1
+    private var lastFitAllRequest = -1
     private var lastBottomInset = -1
     private var lastMapCenterOffsetY = Int.MIN_VALUE
-    private var listenerInstalled = false
+    private var followMyLocation = false
+    private var avatarOverlayInstalled = false
+    private var onFriendSelected: (Friend) -> Unit = {}
+    private val avatarPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = markerColor }
+    private val arrowPath = Path()
+    private val myLocationDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF4285F4.toInt() }
+    private val myLocationRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+    private val myLocationPulsePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF4285F4.toInt() }
+
+    // Hit areas from the last draw: rect -> cluster members, in draw order.
+    private val drawnClusters = mutableListOf<Pair<Rect, List<Friend>>>()
 
     fun sync(
         mapView: MapView,
@@ -859,11 +860,13 @@ private class FriendsMapController(
         selectionRequest: Int,
         sheetSnapRequest: Int,
         myLocationRequest: Int,
+        fitAllRequest: Int,
         sheetVisibleHeightPx: Float,
         mapCenterOffsetY: Int,
         onFriendSelected: (Friend) -> Unit,
     ) {
-        installZoomListener(mapView)
+        installAvatarOverlay(mapView)
+        this.onFriendSelected = onFriendSelected
         val bottomInset = sheetVisibleHeightPx.coerceAtLeast(76f).roundToInt() + 24
         val mappedFriends = friends.filter { it.hasLocation }
         val friendSignature = mappedFriends.joinToString("|") {
@@ -874,6 +877,7 @@ private class FriendsMapController(
         val selectionRequested = selectionRequest != lastSelectionRequest
         val sheetSnapRequested = sheetSnapRequest != lastSheetSnapRequest
         val myLocationRequested = myLocationRequest != lastMyLocationRequest
+        val fitAllRequested = fitAllRequest != lastFitAllRequest
         val bottomInsetChanged = bottomInset != lastBottomInset
         if (bottomInsetChanged) {
             mapView.setPadding(0, 0, 0, bottomInset)
@@ -884,119 +888,277 @@ private class FriendsMapController(
             lastMapCenterOffsetY = mapCenterOffsetY
         }
         if (friendsChanged) {
-            syncFriendMarkers(mapView, mappedFriends, onFriendSelected)
+            friendsByHandle.clear()
+            mappedFriends.forEach { friendsByHandle[it.handle] = it }
+            friendIconCache.keys.removeAll { key -> key.substringBefore('|') !in friendsByHandle.keys }
             lastFriendSignature = friendSignature
         }
-        syncMyLocationMarker(mapView, myLocation)
-        updateFriendMarkerIcons(mapView, selectedFriend?.handle, force = friendsChanged || selectionChanged)
+        val myLocationChanged = myLocation?.latitude != this.myLocation?.latitude ||
+            myLocation?.longitude != this.myLocation?.longitude
+        this.myLocation = myLocation
 
         if (selectedFriend?.hasLocation == true &&
             (selectionRequested || selectionChanged || sheetSnapRequested)
         ) {
+            followMyLocation = false
             zoomToSelected(mapView, selectedFriend)
+        } else if (fitAllRequested && lastFitAllRequest != -1) {
+            followMyLocation = false
+            zoomToFitAll(mapView, mappedFriends, myLocation)
         } else if (myLocationRequested && myLocation != null) {
+            followMyLocation = true
             zoomToLocation(mapView, myLocation)
+        } else if (followMyLocation && myLocation != null && myLocationChanged) {
+            // Following: track new fixes at the user's current zoom.
+            val point = GeoPoint(myLocation.latitude, myLocation.longitude)
+            mapView.post { mapView.controller.animateTo(point) }
         }
         lastSelectedHandle = selectedFriend?.handle
         lastSelectionRequest = selectionRequest
         lastSheetSnapRequest = sheetSnapRequest
         lastMyLocationRequest = myLocationRequest
+        lastFitAllRequest = fitAllRequest
         mapView.invalidate()
     }
 
-    private fun installZoomListener(mapView: MapView) {
-        if (listenerInstalled) return
-        listenerInstalled = true
-        mapView.addMapListener(object : MapListener {
-            override fun onScroll(event: ScrollEvent?): Boolean = false
+    // All friend avatars are drawn by one overlay: at their true map position while
+    // on screen, clamped to the screen edge (shrinking, translucent, with an arrow)
+    // once their position moves off — one continuous pin, never two copies.
+    // Avatars that would overlap merge into a row showing every face.
+    private fun installAvatarOverlay(mapView: MapView) {
+        if (avatarOverlayInstalled) return
+        avatarOverlayInstalled = true
+        mapView.overlays.add(0, object : Overlay() {
+            override fun draw(canvas: AndroidCanvas, mapView: MapView, shadow: Boolean) {
+                if (!shadow) drawFriendAvatars(canvas, mapView)
+            }
 
-            override fun onZoom(event: ZoomEvent?): Boolean {
-                updateFriendMarkerIcons(mapView, lastSelectedHandle)
+            override fun onTouchEvent(event: MotionEvent, mapView: MapView): Boolean {
+                // Any manual map interaction ends follow mode; the button re-arms it.
+                if (event.action == MotionEvent.ACTION_DOWN) followMyLocation = false
                 return false
+            }
+
+            override fun onSingleTapConfirmed(e: MotionEvent, mapView: MapView): Boolean {
+                val x = e.x.roundToInt()
+                val y = e.y.roundToInt()
+                val members = drawnClusters.lastOrNull { it.first.contains(x, y) }?.second
+                    ?: return false
+                if (members.size == 1) {
+                    onFriendSelected(members[0])
+                } else {
+                    // Zoom in far enough to pull the merged group apart.
+                    val box = BoundingBox.fromGeoPointsSafe(
+                        members.map { GeoPoint(it.lat!!, it.lon!!) }
+                    ).increaseByScale(1.6f)
+                    mapView.zoomToBoundingBox(box, true, 64)
+                }
+                return true
             }
         })
     }
 
-    private fun syncFriendMarkers(
-        mapView: MapView,
-        friends: List<Friend>,
-        onFriendSelected: (Friend) -> Unit,
-    ) {
-        val handles = friends.map { it.handle }.toSet()
-        val removed = friendMarkers.keys - handles
-        removed.forEach { handle ->
-            friendMarkers.remove(handle)?.let { mapView.overlays.remove(it) }
-            friendsByHandle.remove(handle)
+    private fun drawFriendAvatars(canvas: AndroidCanvas, mapView: MapView) {
+        drawnClusters.clear()
+        val width = mapView.width
+        // Treat the area under the bottom sheet as offscreen too.
+        val height = mapView.height - lastBottomInset.coerceAtLeast(0)
+        val baseSize = if (mapView.zoomLevelDouble >= 14.0) 192 else 144
+        if (width <= 0 || height <= 0) return
+        val projection = mapView.projection ?: return
+
+        // coerceIn that survives an inverted range (sheet dragged up can shrink the
+        // visible strip below the margins) instead of throwing or hiding everything.
+        fun clamp(v: Int, lo: Int, hi: Int): Int = if (lo <= hi) v.coerceIn(lo, hi) else (lo + hi) / 2
+
+        class Item(
+            val friend: Friend,
+            val x: Int,
+            val y: Int,
+            val rawX: Int,
+            val rawY: Int,
+            val size: Int,
+            val alpha: Int,
+            val offscreen: Boolean,
+        )
+
+        val point = Point()
+
+        // Standard blue "you are here" dot with a pulsing halo, under the friend
+        // pins. The timed invalidate keeps the pulse animating (~30fps) only while
+        // the map is visible and a location exists.
+        myLocation?.let { loc ->
+            projection.toPixels(GeoPoint(loc.latitude, loc.longitude), point)
+            val phase = (SystemClock.uptimeMillis() % MY_LOCATION_PULSE_MS).toFloat() /
+                MY_LOCATION_PULSE_MS
+            myLocationPulsePaint.alpha = (90 * (1f - phase)).roundToInt()
+            canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 28f + phase * 70f, myLocationPulsePaint)
+            canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 28f, myLocationRingPaint)
+            canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 20f, myLocationDotPaint)
+            mapView.postInvalidateDelayed(33L)
         }
 
-        friends.forEach { friend ->
-            friendsByHandle[friend.handle] = friend
-            val point = GeoPoint(friend.lat!!, friend.lon!!)
-            val marker = friendMarkers.getOrPut(friend.handle) {
-                Marker(mapView).also {
-                    it.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                    mapView.overlays.add(it)
-                }
-            }
-            marker.position = point
-            marker.title = friend.name ?: friend.handle
-            marker.subDescription = friend.address ?: friend.fullAddress
-            marker.setOnMarkerClickListener { _, _ ->
-                onFriendSelected(friend)
-                true
-            }
-        }
-        friendIconCache.keys.removeAll { key -> key.substringBefore('|') !in handles }
-    }
+        val items = mutableListOf<Item>()
+        var selectedOnscreen: Item? = null
+        friendsByHandle.values.forEach { friend ->
+            projection.toPixels(GeoPoint(friend.lat!!, friend.lon!!), point)
+            val offX = max(0, max(-point.x, point.x - width))
+            val offY = max(0, max(-point.y, point.y - height))
+            val offscreen = offX > 0 || offY > 0
 
-    private fun syncMyLocationMarker(mapView: MapView, myLocation: Location?) {
-        if (myLocation == null) {
-            myLocationMarker?.let { mapView.overlays.remove(it) }
-            myLocationMarker = null
-            return
-        }
-        val point = GeoPoint(myLocation.latitude, myLocation.longitude)
-        val marker = myLocationMarker ?: Marker(mapView).also {
-            it.title = "You"
-            it.icon = currentLocationMarkerIcon(context, meMarkerColor, meMarkerInnerColor)
-            it.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-            mapView.overlays.add(it)
-            myLocationMarker = it
-        }
-        marker.position = point
-    }
+            // Shrink and fade with distance in viewports: still full size and opacity
+            // at the moment the pin sticks to the edge, so the transition is seamless.
+            val screensAway = hypot(offX.toDouble(), offY.toDouble()) / min(width, height)
+            val size = (baseSize / (1.0 + screensAway)).roundToInt()
+                .coerceAtLeast(EDGE_AVATAR_MIN_SIZE_PX)
+            val alpha = 255 -
+                ((255 - EDGE_INDICATOR_MAX_ALPHA) * min(1.0, screensAway * 2)).roundToInt()
 
-    private fun updateFriendMarkerIcons(
-        mapView: MapView,
-        selectedHandle: String?,
-        force: Boolean = false,
-    ) {
-        val zoomed = mapView.zoomLevelDouble >= 14.0
-        if (!force && zoomed == zoomedIcons && friendMarkers.values.all { it.icon != null }) return
-        zoomedIcons = zoomed
-        friendMarkers.forEach { (handle, marker) ->
-            val friend = friendsByHandle[handle] ?: return@forEach
-            val selected = handle == selectedHandle
-            val size = when {
-                selected -> 192
-                zoomed -> 192
-                else -> 144
-            }
-            val key = "$handle|$size|$selected|${friend.photoUri}|${friend.name}"
-            marker.icon = friendIconCache.getOrPut(key) {
-                if (selected) {
-                    selectedFriendMarkerIcon(context, friend, markerColor, markerTextColor, size)
-                } else {
-                    friendPhotoMarkerIcon(context, friend, markerColor, markerTextColor, size)
-                }
-            }
-            if (selected) {
-                marker.setAnchor(Marker.ANCHOR_CENTER, 1.0f)
+            // Onscreen pins sit exactly on their location — never moved. Offscreen
+            // pins ease from their exact exit point into the margin band (room for
+            // the arrow), so the hand-off is continuous.
+            val x: Int
+            val y: Int
+            if (offscreen) {
+                val margin = size / 2 + EDGE_AVATAR_MARGIN_PX
+                val t = min(1.0, max(offX, offY).toDouble() / margin)
+                val startX = point.x.coerceIn(0, width)
+                val startY = point.y.coerceIn(0, height)
+                x = (startX + (clamp(point.x, margin, width - margin) - startX) * t).roundToInt()
+                y = (startY + (clamp(point.y, margin, height - margin) - startY) * t).roundToInt()
             } else {
-                marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                x = point.x
+                y = point.y
+            }
+            val item = Item(
+                friend,
+                x,
+                y,
+                point.x,
+                point.y,
+                size,
+                alpha,
+                offscreen,
+            )
+            if (friend.handle == lastSelectedHandle && !offscreen) {
+                selectedOnscreen = item // drawn last, on top, as the callout
+            } else {
+                items.add(item)
             }
         }
-        mapView.invalidate()
+
+        val clusters = clusterByProximity(items, { it.x }, { it.y }, { it.size })
+
+        // Every cluster — on-screen, offscreen, or mixed — is the same circular
+        // group pin: one disc of normal pin size with all the faces inside (grid in
+        // the inscribed square). On-screen it sits on the members' true centroid and
+        // splits apart as zooming in stops them overlapping; offscreen it shrinks,
+        // fades, sticks to the edge band, and gains a direction arrow — so a group
+        // sliding off screen keeps its avatar, and nearby leavers just join it.
+        clusters.forEach { cluster ->
+            val size = cluster.maxOf { it.size }
+            val alpha = cluster.maxOf { it.alpha }
+            val offscreenGroup = cluster.any { it.offscreen }
+
+            var cx = cluster.sumOf { it.x } / cluster.size
+            var cy = cluster.sumOf { it.y } / cluster.size
+            if (offscreenGroup) {
+                val margin = size / 2 + EDGE_AVATAR_MARGIN_PX
+                cx = clamp(cx, margin, width - margin)
+                cy = clamp(cy, margin, height - margin)
+            }
+            val left = cx - size / 2
+            val top = cy - size / 2
+
+            // Fade the pin as one composite: disc, faces, and arrow render opaque
+            // into a layer that carries the whole group's alpha, so their overlaps
+            // don't stack into darker seams.
+            val faded = alpha < 255
+            if (faded) {
+                val pad = EDGE_ARROW_LENGTH_PX + 4f
+                canvas.saveLayerAlpha(
+                    left - pad, top - pad, left + size + pad, top + size + pad, alpha
+                )
+            }
+            avatarPaint.alpha = 255
+            arrowPaint.alpha = 255
+
+            if (cluster.size == 1) {
+                canvas.drawBitmap(
+                    avatarIconFor(cluster[0].friend, baseSize).bitmap,
+                    null,
+                    Rect(left, top, left + size, top + size),
+                    avatarPaint
+                )
+            } else {
+                val n = cluster.size
+                layoutClusterFaces(
+                    pinSize = size,
+                    memberSizes = IntArray(n) { cluster[it].size },
+                    rawX = IntArray(n) { cluster[it].rawX },
+                    rawY = IntArray(n) { cluster[it].rawY },
+                ).forEach { face ->
+                    val l = (cx + face.x - face.size / 2.0).roundToInt()
+                    val t = (cy + face.y - face.size / 2.0).roundToInt()
+                    canvas.drawBitmap(
+                        avatarIconFor(cluster[face.member].friend, baseSize).bitmap,
+                        null,
+                        Rect(l, t, l + face.size, t + face.size),
+                        avatarPaint
+                    )
+                }
+            }
+            drawnClusters.add(
+                Rect(left, top, left + size, top + size) to cluster.map { it.friend }
+            )
+
+            // Arrow on the outer rim pointing at where the friend(s) actually are.
+            if (offscreenGroup) {
+                val towardX = cluster.sumOf { it.rawX } / cluster.size - cx.toFloat()
+                val towardY = cluster.sumOf { it.rawY } / cluster.size - cy.toFloat()
+                if (towardX != 0f || towardY != 0f) {
+                    val angleDeg =
+                        Math.toDegrees(atan2(towardY.toDouble(), towardX.toDouble())).toFloat()
+                    val half = size / 2f
+                    arrowPath.reset()
+                    arrowPath.moveTo(half + EDGE_ARROW_LENGTH_PX, 0f)
+                    arrowPath.lineTo(half - 2f, -EDGE_ARROW_LENGTH_PX * 0.6f)
+                    arrowPath.lineTo(half - 2f, EDGE_ARROW_LENGTH_PX * 0.6f)
+                    arrowPath.close()
+                    canvas.save()
+                    canvas.translate(cx.toFloat(), cy.toFloat())
+                    canvas.rotate(angleDeg)
+                    canvas.drawPath(arrowPath, arrowPaint)
+                    canvas.restore()
+                }
+            }
+            if (faded) canvas.restore()
+        }
+
+        // Selected friend keeps the callout look, anchored on its true position.
+        selectedOnscreen?.let { item ->
+            val friend = item.friend
+            val key = "${friend.handle}|$baseSize|true|${friend.photoUri}|${friend.name}"
+            val icon = friendIconCache.getOrPut(key) {
+                selectedFriendMarkerIcon(context, friend, markerColor, markerTextColor, baseSize)
+            }
+            val dst = Rect(
+                item.rawX - icon.bitmap.width / 2,
+                item.rawY - icon.bitmap.height,
+                item.rawX + icon.bitmap.width / 2,
+                item.rawY,
+            )
+            avatarPaint.alpha = 255
+            canvas.drawBitmap(icon.bitmap, null, dst, avatarPaint)
+            drawnClusters.add(dst to listOf(friend))
+        }
+    }
+
+    private fun avatarIconFor(friend: Friend, size: Int): BitmapDrawable {
+        val key = "${friend.handle}|$size|false|${friend.photoUri}|${friend.name}"
+        return friendIconCache.getOrPut(key) {
+            friendPhotoMarkerIcon(context, friend, markerColor, markerTextColor, size)
+        }
     }
 
     private fun zoomToSelected(
@@ -1018,9 +1180,148 @@ private class FriendsMapController(
         }
     }
 
+    private fun zoomToFitAll(mapView: MapView, friends: List<Friend>, myLocation: Location?) {
+        val points = friends.map { GeoPoint(it.lat!!, it.lon!!) }.toMutableList()
+        myLocation?.let { points.add(GeoPoint(it.latitude, it.longitude)) }
+        if (points.isEmpty()) return
+        if (points.size == 1) {
+            zoomToLocation(mapView, Location("").apply {
+                latitude = points[0].latitude
+                longitude = points[0].longitude
+            })
+            return
+        }
+        val group = densestFitGroup(points)
+        if (group.size == 1) {
+            zoomToLocation(mapView, Location("").apply {
+                latitude = group[0].latitude
+                longitude = group[0].longitude
+            })
+            return
+        }
+        val box = BoundingBox.fromGeoPointsSafe(group).increaseByScale(1.4f)
+        mapView.post {
+            mapView.zoomToBoundingBox(box, true, 64)
+        }
+    }
+
 }
 
-private fun friendPhotoMarkerIcon(
+/**
+ * Everyone fits at a useful zoom? Show everyone. Otherwise find the fixed-size
+ * window holding the MOST points — exact, since some optimal window has a point
+ * on its south edge and one on its west edge. O(n³) but n is your friends list.
+ * ponytail: ignores the antimeridian; split lon windows if your friends straddle it
+ */
+fun densestFitGroup(points: List<GeoPoint>): List<GeoPoint> {
+    if (points.size < 2) return points
+    var group: List<GeoPoint> = points
+    val fullBox = BoundingBox.fromGeoPointsSafe(points)
+    if (fullBox.latitudeSpan > MAX_FIT_SPAN_DEGREES ||
+        fullBox.longitudeSpanWithDateLine > MAX_FIT_SPAN_DEGREES
+    ) {
+        for (south in points) for (west in points) {
+            val candidate = points.filter {
+                it.latitude >= south.latitude &&
+                    it.latitude <= south.latitude + MAX_FIT_SPAN_DEGREES &&
+                    it.longitude >= west.longitude &&
+                    it.longitude <= west.longitude + MAX_FIT_SPAN_DEGREES
+            }
+            if (candidate.size > group.size || group === points) group = candidate
+        }
+    }
+    return group
+}
+
+/**
+ * Greedy proximity clustering: avatars merge only once they substantially
+ * overlap (centers within ~half a pin), so the compression into one
+ * footprint at the merge moment is small — pins near their true spots
+ * barely move. ponytail: order-dependent chaining is possible but harmless here.
+ */
+fun <T> clusterByProximity(
+    items: List<T>,
+    x: (T) -> Int,
+    y: (T) -> Int,
+    size: (T) -> Int,
+): List<List<T>> {
+    val clusters = mutableListOf<MutableList<T>>()
+    items.forEach { item ->
+        val near = clusters.firstOrNull { cluster ->
+            cluster.any {
+                hypot((x(it) - x(item)).toDouble(), (y(it) - y(item)).toDouble()) <
+                    (size(it) + size(item)) * 0.25
+            }
+        }
+        if (near != null) near.add(item) else clusters.add(mutableListOf(item))
+    }
+    return clusters
+}
+
+/** One face of a group pin: member index, offset from pin center, and draw size. */
+class ClusterFace(val member: Int, val x: Double, val y: Double, val size: Int)
+
+/**
+ * Faces keep the members' real relative arrangement: their true offsets from
+ * the group centroid, scaled to fit the pin footprint, with a light push-apart
+ * pass so nobody fully hides behind a neighbor. Returned in draw order —
+ * smaller (farther) faces first, so closer members draw larger and on top.
+ */
+fun layoutClusterFaces(
+    pinSize: Int,
+    memberSizes: IntArray,
+    rawX: IntArray,
+    rawY: IntArray,
+): List<ClusterFace> {
+    val n = memberSizes.size
+    val sinHalf = sin(PI / n)
+    val d = (pinSize * sinHalf / (0.75 + sinHalf)).roundToInt()
+    val faceSizes = IntArray(n) { i ->
+        (d * (memberSizes[i].toFloat() / pinSize)).roundToInt().coerceAtLeast(d / 2)
+    }
+    val centroidX = rawX.sum().toDouble() / n
+    val centroidY = rawY.sum().toDouble() / n
+    var scale = Double.MAX_VALUE
+    for (i in 0 until n) {
+        val r = hypot(rawX[i] - centroidX, rawY[i] - centroidY)
+        if (r > 1.0) scale = min(scale, (pinSize - faceSizes[i]) / 2.0 / r)
+    }
+    if (scale == Double.MAX_VALUE) scale = 0.0
+    val px = DoubleArray(n) { i -> (rawX[i] - centroidX) * scale }
+    val py = DoubleArray(n) { i -> (rawY[i] - centroidY) * scale }
+    repeat(3) {
+        for (i in 0 until n) for (j in i + 1 until n) {
+            var dx = px[j] - px[i]
+            var dy = py[j] - py[i]
+            var dist = hypot(dx, dy)
+            val sep = (faceSizes[i] + faceSizes[j]) / 2.0 * 0.7
+            if (dist < sep) {
+                if (dist < 1.0) {
+                    dx = 1.0
+                    dy = 0.0
+                    dist = 1.0
+                }
+                val push = (sep - dist) / 2
+                px[i] -= dx / dist * push
+                py[i] -= dy / dist * push
+                px[j] += dx / dist * push
+                py[j] += dy / dist * push
+            }
+        }
+    }
+    return (0 until n).sortedBy { faceSizes[it] }.map { i ->
+        // Keep each face inside the pin circle after the push-apart.
+        val maxR = (pinSize - faceSizes[i]) / 2.0
+        val r = hypot(px[i], py[i])
+        if (r > maxR && r > 0.0) {
+            px[i] *= maxR / r
+            py[i] *= maxR / r
+        }
+        ClusterFace(i, px[i], py[i], faceSizes[i])
+    }
+}
+
+fun friendPhotoMarkerIcon(
     context: Context,
     friend: Friend,
     markerColor: Int,
@@ -1057,21 +1358,6 @@ private fun selectedFriendMarkerIcon(
     }
     val label = (friend.name ?: friend.handle).trim().firstOrNull()?.uppercase() ?: "?"
     val bitmap = selectedContactCalloutBitmap(photo, label, markerColor, markerTextColor, avatarSize)
-    return BitmapDrawable(context.resources, bitmap)
-}
-
-private fun currentLocationMarkerIcon(
-    context: Context,
-    markerColor: Int,
-    innerColor: Int,
-): BitmapDrawable {
-    val bitmap = Bitmap.createBitmap(36, 36, Bitmap.Config.ARGB_8888)
-    val canvas = AndroidCanvas(bitmap)
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    paint.color = markerColor
-    canvas.drawCircle(18f, 18f, 18f, paint)
-    paint.color = innerColor
-    canvas.drawCircle(18f, 18f, 8f, paint)
     return BitmapDrawable(context.resources, bitmap)
 }
 
@@ -1200,6 +1486,7 @@ private fun FriendsBottomSheet(
     friends: List<Friend>,
     selectedFriend: Friend?,
     myLocation: Location?,
+    lastPushedAtMillis: Long,
     refreshingHandles: Map<String, Boolean>,
     hiddenBottomPaddingPx: Float,
     onRefresh: () -> Unit,
@@ -1257,7 +1544,7 @@ private fun FriendsBottomSheet(
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             when {
                                 !configured -> {
-                                    FriendsSheetHeader(loading, configured, onRefresh)
+                                    FriendsSheetHeader(loading, configured, lastPushedAtMillis, onRefresh)
                                     Text(
                                         "Set the forwarding base URL and token in Settings first.",
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1265,7 +1552,7 @@ private fun FriendsBottomSheet(
                                 }
 
                                 else -> {
-                                    FriendsSheetHeader(loading, configured, onRefresh)
+                                    FriendsSheetHeader(loading, configured, lastPushedAtMillis, onRefresh)
                                     if (!contactsGranted) {
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
@@ -1307,7 +1594,8 @@ private fun FriendsBottomSheet(
                                                 friend = friend,
                                                 myLocation = myLocation,
                                                 refreshing = refreshingHandles[friend.handle] == true,
-                                                onClick = { onFriendSelected(friend) }
+                                                onClick = { onFriendSelected(friend) },
+                                                modifier = Modifier.animateItem()
                                             )
                                         }
                                     }
@@ -1325,6 +1613,7 @@ private fun FriendsBottomSheet(
 private fun FriendsSheetHeader(
     loading: Boolean,
     configured: Boolean,
+    lastPushedAtMillis: Long,
     onRefresh: () -> Unit,
 ) {
     Row(
@@ -1332,7 +1621,16 @@ private fun FriendsSheetHeader(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text("Friends", style = MaterialTheme.typography.titleLarge)
+        Column {
+            Text("Friends", style = MaterialTheme.typography.titleLarge)
+            lastPushedLabel(lastPushedAtMillis)?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (loading) {
                 CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
@@ -1443,6 +1741,7 @@ private fun FriendRow(
     myLocation: Location?,
     refreshing: Boolean,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val place = friend.address ?: friend.fullAddress?.replace("\n", ", ")
     val time = if (friend.timestamp > 0) relativeTime(friend.timestamp) else null
@@ -1453,7 +1752,7 @@ private fun FriendRow(
             .joinToString(" · ")
     }
 
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(modifier = modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1478,19 +1777,15 @@ private fun FriendRow(
                     )
                 }
             }
-            when {
-                refreshing -> {
-                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                }
-
-                friend.hasLocation -> {
+            if (refreshing) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            } else if (friend.hasLocation) {
                 myLocation?.let {
                     Text(
                         text = formatMiles(it, friend.lat!!, friend.lon!!),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                }
                 }
             }
         }
