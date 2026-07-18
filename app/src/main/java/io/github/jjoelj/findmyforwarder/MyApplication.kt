@@ -7,6 +7,9 @@ class MyApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         FileLogger.init(this)
+        // load() resolves the tile cache path; without it the disk cache is dead
+        // and every map render re-downloads every tile.
+        Configuration.getInstance().load(this, getSharedPreferences("osmdroid", MODE_PRIVATE))
         Configuration.getInstance().userAgentValue = packageName
         val prefs = SharedPreferencesProvider(this)
         val lat = prefs.lastSentLat.toDoubleOrNull()

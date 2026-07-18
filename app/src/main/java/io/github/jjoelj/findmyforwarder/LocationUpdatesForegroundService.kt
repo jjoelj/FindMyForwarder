@@ -17,16 +17,13 @@ import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.util.ArrayList
 
 class LocationUpdatesForegroundService : Service() {
 
@@ -39,19 +36,18 @@ class LocationUpdatesForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     companion object {
-        const val START_FOREGROUND_ACTION = "START_FOREGROUND_ACTION"
         const val ACTIVITY_TRANSITION_ACTION = "ACTIVITY_TRANSITION_ACTION"
         const val RESET_LOCATION_ACTION = "RESET_LOCATION_ACTION"
-        const val EXTRA_TRANSITION_EVENTS = "EXTRA_TRANSITION_EVENTS"
+        const val EXTRA_ACTIVITY_TYPE = "EXTRA_ACTIVITY_TYPE"
+        const val EXTRA_TRANSITION_TYPE = "EXTRA_TRANSITION_TYPE"
 
         fun isRunning() = isServiceInForeground
 
         @Volatile
         private var isServiceInForeground = false
-
-        @Volatile
-        private var isActivityRecognitionActive = false
     }
+
+    private var locationUpdatesRequested = false
 
     override fun onBind(intent: Intent?): IBinder? {
         return null
@@ -114,6 +110,9 @@ class LocationUpdatesForegroundService : Service() {
                     val body = response.body.string()
                     FileLogger.i(body)
                     AppStatus.setPostResult(response.isSuccessful, "HTTP ${response.code}")
+                    if (response.isSuccessful) {
+                        prefs.lastPushedAtMillis = System.currentTimeMillis()
+                    }
                     response.isSuccessful
                 }
             } catch (e: Exception) {
@@ -123,92 +122,80 @@ class LocationUpdatesForegroundService : Service() {
             }
         }
 
-    @OptIn(DelicateCoroutinesApi::class)
+    // Everything here is synchronous and ordered — the previous GlobalScope.launch per
+    // intent let coroutines from back-to-back transitions interleave, which could
+    // re-post the notification after a STILL stop.
     @RequiresPermission(Manifest.permission.ACTIVITY_RECOGNITION)
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        GlobalScope.launch {
-            val notification = notificationProvider.createNotification(null)
-            startForeground(
-                NotificationProvider.NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-            )
+        val notification = notificationProvider.createNotification(prefs.lastActivityName)
+        startForeground(
+            NotificationProvider.NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        )
 
-            if (!isServiceInForeground) {
-                isServiceInForeground = true
-                AppStatus.setServiceRunning(true)
-                FileLogger.i("LocationUpdatesForegroundService started in foreground.")
-            }
+        if (!isServiceInForeground) {
+            isServiceInForeground = true
+            AppStatus.setServiceRunning(true)
+            FileLogger.i("LocationUpdatesForegroundService started in foreground.")
+        }
 
-            if (!isActivityRecognitionActive) {
-                isActivityRecognitionActive = true
-                AppStatus.setActivityRecognitionActive(true)
-                ActivityRecognitionProvider(applicationContext).apply {
-                    startActivityTransitionRecognitionWithBroadcast()
-                }
-            }
+        when (intent?.action) {
+            ACTIVITY_TRANSITION_ACTION -> handleActivityTransition(intent)
 
-            when (intent?.action) {
-                START_FOREGROUND_ACTION -> {
-                    FileLogger.i("Received START_FOREGROUND_ACTION")
-                    stopForeground()
-                }
-
-                ACTIVITY_TRANSITION_ACTION -> {
-                    @Suppress("UNCHECKED_CAST")
-                    val transitionEvents = intent.getSerializableExtra(
-                        EXTRA_TRANSITION_EVENTS,
-                        ArrayList::class.java
-                    ) as? ArrayList<ActivityRecognitionEvent>
-
-                    val currentActivity = transitionEvents?.lastOrNull()
-                    if (currentActivity == null) {
-                        FileLogger.w("No activity recognition events found in intent.")
-                        return@launch
-                    }
-
-                    val currentActivityName = currentActivity.activityType.getActivityName()
-                    val currentTransitionName = currentActivity.transitionType.getTransitionName()
-                    val event = "Activity: $currentActivityName, Transition: $currentTransitionName"
-                    FileLogger.i("Received ACTIVITY_TRANSITION_ACTION - $event")
-                    AppStatus.setActivity(currentActivityName, currentTransitionName)
-
-                    notificationProvider.updateNotification(currentActivityName)
-
-                    if (currentActivity.activityType != DetectedActivity.STILL) {
-                        if (currentActivity.transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER) {
-                            val locationRequest = buildLocationRequest(currentActivity)
-
-                            fusedLocationProviderClient.requestLocationUpdates(
-                                locationRequest,
-                                locationCallback,
-                                Looper.getMainLooper()
-                            ).addOnFailureListener {
-                                FileLogger.e("Failed to start location updates: ${it.message}")
-                                AppStatus.setLocationUpdatesActive(false)
-                            }.addOnSuccessListener {
-                                AppStatus.setLocationUpdatesActive(true)
-                            }
-                        } else if (currentActivity.transitionType == ActivityTransition.ACTIVITY_TRANSITION_EXIT) {
-                            stopLocationUpdates()
-                        }
-                    } else if (currentActivity.transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER) {
-                        sendCurrentLocation()
-                        stopForeground()
-                    }
-                }
-
-                RESET_LOCATION_ACTION -> {
-                    FileLogger.i("Received RESET_LOCATION_ACTION")
-                    sendCurrentLocation()
-                }
+            RESET_LOCATION_ACTION -> {
+                FileLogger.i("Received RESET_LOCATION_ACTION")
+                sendCurrentLocation()
             }
         }
-        return START_STICKY
+        // NOT_STICKY: a sticky restart redelivers a null intent, leaving a zombie
+        // foreground service showing the last saved activity. Transitions restart us.
+        return START_NOT_STICKY
     }
 
-    private fun buildLocationRequest(detectedActivity: ActivityRecognitionEvent): LocationRequest {
-        return when (detectedActivity.activityType) {
+    private fun handleActivityTransition(intent: Intent) {
+        val activityType = intent.getIntExtra(EXTRA_ACTIVITY_TYPE, -1)
+        val transitionType = intent.getIntExtra(EXTRA_TRANSITION_TYPE, -1)
+
+        val activityName = activityType.getActivityName()
+        val transitionName = transitionType.getTransitionName()
+        FileLogger.i("Received ACTIVITY_TRANSITION_ACTION - Activity: $activityName, Transition: $transitionName")
+        AppStatus.setActivity(activityName, transitionName)
+
+        if (activityType == DetectedActivity.STILL) {
+            // Don't persist or show "Still" — we're stopping; saving it would make the
+            // next cold start's notification say "Still" before the real activity arrives.
+            if (transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER) {
+                // Post the final resting location; sendCurrentLocation's completion
+                // then stops the service via stopIfIdle().
+                stopLocationUpdates()
+                sendCurrentLocation()
+            }
+            return
+        }
+
+        prefs.lastActivityName = activityName
+        notificationProvider.updateNotification(activityName)
+
+        if (transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER) {
+            locationUpdatesRequested = true
+            fusedLocationProviderClient.requestLocationUpdates(
+                buildLocationRequest(activityType),
+                locationCallback,
+                Looper.getMainLooper()
+            ).addOnFailureListener {
+                FileLogger.e("Failed to start location updates: ${it.message}")
+                AppStatus.setLocationUpdatesActive(false)
+            }.addOnSuccessListener {
+                AppStatus.setLocationUpdatesActive(true)
+            }
+        } else if (transitionType == ActivityTransition.ACTIVITY_TRANSITION_EXIT) {
+            stopLocationUpdates()
+        }
+    }
+
+    private fun buildLocationRequest(activityType: Int): LocationRequest {
+        return when (activityType) {
             DetectedActivity.IN_VEHICLE -> LocationRequest.Builder(30_000L)
                 .setMinUpdateIntervalMillis(15_000L)
                 .setMaxUpdateDelayMillis(120_000L)
@@ -266,10 +253,20 @@ class LocationUpdatesForegroundService : Service() {
                 } else {
                     FileLogger.w("Current location is null.")
                 }
+                stopIfIdle()
             }
             .addOnFailureListener {
                 FileLogger.e("Failed to get current location: ${it.message}")
+                stopIfIdle()
             }
+    }
+
+    // A one-shot RESET_LOCATION_ACTION must not leave the service parked in the
+    // foreground with a stale "Detected Activity" notification.
+    private fun stopIfIdle() {
+        if (!locationUpdatesRequested) {
+            stopForeground()
+        }
     }
 
     private fun stopForeground() {
@@ -281,6 +278,7 @@ class LocationUpdatesForegroundService : Service() {
     }
 
     private fun stopLocationUpdates() {
+        locationUpdatesRequested = false
         fusedLocationProviderClient.removeLocationUpdates(locationCallback).addOnFailureListener {
             FileLogger.e("Failed to stop location updates: ${it.message}")
         }.addOnSuccessListener {
@@ -291,7 +289,6 @@ class LocationUpdatesForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        notificationProvider.destroyNotification()
         client.dispatcher.executorService.shutdown();
     }
 }
