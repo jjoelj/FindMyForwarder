@@ -100,6 +100,11 @@ fun startActivityRecognition(context: Context) {
         FileLogger.w("Missing required permissions")
         return
     }
+    // Play Services echoes the current activity back the instant you register, so
+    // re-registering on every app open costs a GPS fix and a POST for nothing. A running
+    // service already implies a live registration; boot and package-replace both reach
+    // here with it stopped, so they still register.
+    if (LocationUpdatesForegroundService.isRunning()) return
     ActivityRecognitionProvider(context.applicationContext)
         .startActivityTransitionRecognitionWithBroadcast()
 }

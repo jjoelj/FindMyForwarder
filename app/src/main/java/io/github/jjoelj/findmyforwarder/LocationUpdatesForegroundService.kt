@@ -41,6 +41,8 @@ class LocationUpdatesForegroundService : Service() {
         const val EXTRA_ACTIVITY_TYPE = "EXTRA_ACTIVITY_TYPE"
         const val EXTRA_TRANSITION_TYPE = "EXTRA_TRANSITION_TYPE"
 
+        fun isRunning() = isServiceInForeground
+
         @Volatile
         private var isServiceInForeground = false
     }
