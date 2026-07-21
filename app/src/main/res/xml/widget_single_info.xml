@@ -9,4 +9,5 @@
     android:widgetCategory="home_screen"
     android:configure="io.github.jjoelj.findmyforwarder.SingleFriendWidgetConfigActivity"
     android:widgetFeatures="reconfigurable"
-    android:initialLayout="@layout/widget_map" />
+    android:initialLayout="@layout/widget_map"
+    android:previewLayout="@layout/widget_single_preview" />

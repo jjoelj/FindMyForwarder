@@ -7,4 +7,5 @@
     android:resizeMode="horizontal|vertical"
     android:updatePeriodMillis="1800000"
     android:widgetCategory="home_screen"
-    android:initialLayout="@layout/widget_map" />
+    android:initialLayout="@layout/widget_map"
+    android:previewLayout="@layout/widget_map_preview" />

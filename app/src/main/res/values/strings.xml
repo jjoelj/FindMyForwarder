@@ -1,3 +1,19 @@
 <resources>
     <string name="app_name">Find My Forwarder</string>
+
+    <!--
+      Sample text baked into the widget-picker previews; never shown on a live widget.
+      Each string mirrors the format its widget actually produces, so the picker is not
+      advertising a layout the user will never see:
+        Nearby  -> "Nearby (n)" / "Within n mi"   (NearbyMapWidget.widgetLabel/widgetStatus)
+        Single  -> name / "distance · address · time" and no updated label
+        Map     -> no title, no status, updated label only
+    -->
+    <string name="widget_preview_map_desc">Map of friends\' locations</string>
+    <string name="widget_preview_refresh_desc">Refresh</string>
+    <string name="widget_preview_updated">Updated 4:20 PM</string>
+    <string name="widget_preview_nearby">Nearby (3)</string>
+    <string name="widget_preview_nearby_status">Within 2 mi</string>
+    <string name="widget_preview_single_name">Joel</string>
+    <string name="widget_preview_single_status">0.4 mi · Foothill Blvd · 4:20 PM</string>
 </resources>

@@ -72,7 +72,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -114,6 +113,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
@@ -137,16 +137,50 @@ private const val MAP_ANIMATION_DURATION_MS = 450L
 // screen size + zoom math if this feels wrong on tablets
 private const val MAX_FIT_SPAN_DEGREES = 60.0
 
-private const val EDGE_AVATAR_MIN_SIZE_PX = 48
+private const val EDGE_AVATAR_MIN_SIZE_PX = 68
+
+// Avatars scale with zoom on a ramp rather than stepping at a threshold. Bitmaps are
+// always rendered at one resolution and scaled into place — letting the drawn size drive
+// the render size instead would mint a new bitmap per zoom frame and thrash the cache.
+private const val AVATAR_ICON_RENDER_PX = 192
+private const val AVATAR_SIZE_MIN_PX = 144f
+private const val AVATAR_SIZE_MAX_PX = 192f
+private const val AVATAR_ZOOM_MIN = 12.0
+private const val AVATAR_ZOOM_MAX = 16.0
+
+// Time-based rather than a per-frame fraction: a fraction of the remaining gap is
+// exponential decay, which eases out but never eases in, and its speed rides on the
+// frame rate. These are real durations with a cubic in-out curve.
+private const val SIZE_EASE_MS = 140L
+private const val OFFSET_EASE_MS = 260L
+
+/** Cubic ease-in-out: accelerates out of the old position, decelerates into the new. */
+private fun easeInOutCubic(t: Float): Float =
+    if (t < 0.5f) 4f * t * t * t
+    else 1f - ((-2f * t + 2f).let { it * it * it }) / 2f
+
+private fun avatarBaseSize(zoom: Double): Int {
+    val t = ((zoom - AVATAR_ZOOM_MIN) / (AVATAR_ZOOM_MAX - AVATAR_ZOOM_MIN)).coerceIn(0.0, 1.0)
+    return (AVATAR_SIZE_MIN_PX + (AVATAR_SIZE_MAX_PX - AVATAR_SIZE_MIN_PX) * t).roundToInt()
+}
 
 // Margin leaves room for the direction arrow drawn outside the avatar.
 private const val EDGE_AVATAR_MARGIN_PX = 28
 private const val EDGE_ARROW_LENGTH_PX = 22f
 
-// Translucent so edge hints don't read as actual positions on the map.
-private const val EDGE_INDICATOR_MAX_ALPHA = 170
+// Translucent so edge hints don't read as actual positions on the map, but only just —
+// they already shrink with distance, and on a dark basemap the dimmed avatar plus a
+// heavy fade left them too faint to pick out.
+private const val EDGE_INDICATOR_MAX_ALPHA = 220
 
 private const val MY_LOCATION_PULSE_MS = 2000L
+
+// Edge puck is smaller than the onscreen dot so it reads as an indicator, not a fix. The
+// dot is drawn as a fixed fraction of the ring so both shrink together on the way out.
+private const val MY_LOCATION_RADIUS = 28f
+private const val MY_LOCATION_EDGE_RADIUS = 22f
+private const val MY_LOCATION_DOT_RATIO = 20f / 28f
+private const val MY_LOCATION_ARROW_GAP = 6f
 private const val SHEET_FLING_VELOCITY_THRESHOLD = 900f
 private const val FRIENDS_LIST_POLL_INTERVAL_MILLIS = 60_000L
 private const val FRIENDS_AUTO_REFRESH_DELAY_MILLIS = 10_000L
@@ -254,10 +288,12 @@ private fun contactNickname(context: Context, contactId: Long): String? =
         if (c.moveToFirst()) c.getString(0)?.takeIf { it.isNotBlank() } else null
     }
 
-fun relativeTime(epochSeconds: Long): String {
-    val deltaMs = System.currentTimeMillis() - epochSeconds * 1000
-    return if (deltaMs < 60_000) "Now"
-    else DateUtils.getRelativeTimeSpanString(epochSeconds * 1000).toString()
+fun relativeTime(epochSeconds: Long, nowMillis: Long = System.currentTimeMillis()): String {
+    val atMillis = epochSeconds * 1000
+    return if (nowMillis - atMillis < 60_000) "Now"
+    else DateUtils
+        .getRelativeTimeSpanString(atMillis, nowMillis, DateUtils.MINUTE_IN_MILLIS)
+        .toString()
 }
 
 fun distanceMeters(from: Location, lat: Double, lon: Double): Float {
@@ -556,9 +592,10 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         val collapsedOffset = (sheetMaxHeightPx - with(density) { 72.dp.toPx() }).coerceAtLeast(0f)
         val sheetOffset = remember { Animatable(halfOffset) }
         val mapCenterOffset = remember { Animatable(0f) }
-        var mapSheetVisibleHeightPx by remember {
-            mutableFloatStateOf(sheetMaxHeightPx / 2f)
-        }
+        // Derived rather than snapshotted on settle: reading sheetOffset here recomposes
+        // every drag frame, so the map's bottom inset — and the edge pins clamped against
+        // it — track the sheet live instead of jumping when it stops.
+        val mapSheetVisibleHeightPx = sheetMaxHeightPx - sheetOffset.value
         val sheetAnchors = remember(sheetMaxHeightPx, collapsedOffset) {
             listOf(fullOffset, twoThirdOffset, halfOffset, collapsedOffset)
         }
@@ -566,8 +603,9 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         // taller sheet (which covers the map) hides them.
         val showMyLocationButton = myLocation != null &&
             sheetOffset.value > halfOffset - with(density) { 3.dp.toPx() }
-        fun updateMapSheetHeight(offset: Float) {
-            mapSheetVisibleHeightPx = sheetMaxHeightPx - offset
+        // The height itself is now derived; this only asks the map to re-frame once the
+        // sheet has settled on an anchor.
+        fun updateMapSheetHeight(@Suppress("UNUSED_PARAMETER") offset: Float) {
             mapSheetSnapRequest++
         }
         fun targetMapCenterOffset(offset: Float): Float =
@@ -686,6 +724,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
             fitAllRequest = mapFitAllRequest,
             sheetVisibleHeightPx = mapSheetVisibleHeightPx,
             mapCenterOffsetY = mapCenterOffset.value.roundToInt(),
+            controlsVisible = showMyLocationButton,
             onFriendSelected = { selectFriend(it) },
             modifier = Modifier.fillMaxSize()
         )
@@ -721,7 +760,13 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                 )
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Clickable Surface rather than a nested IconButton: IconButton's ripple
+                // is an unbounded 20dp circle, so it never filled these rounded squares.
                 Surface(
+                    onClick = {
+                        clearSelection(keepSheetPosition = true)
+                        mapFitAllRequest++
+                    },
                     modifier = Modifier
                         .size(48.dp),
                     shape = RoundedCornerShape(16.dp),
@@ -729,12 +774,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                     tonalElevation = 4.dp,
                     shadowElevation = 4.dp,
                 ) {
-                    IconButton(
-                        onClick = {
-                            clearSelection(keepSheetPosition = true)
-                            mapFitAllRequest++
-                        }
-                    ) {
+                    Box(contentAlignment = Alignment.Center) {
                         Icon(
                             painterResource(R.drawable.zoom_out_map_24px),
                             contentDescription = "Show everyone"
@@ -742,6 +782,10 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                     }
                 }
                 Surface(
+                    onClick = {
+                        clearSelection(keepSheetPosition = true)
+                        mapMyLocationRequest++
+                    },
                     modifier = Modifier
                         .size(48.dp),
                     shape = RoundedCornerShape(16.dp),
@@ -749,12 +793,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                     tonalElevation = 4.dp,
                     shadowElevation = 4.dp,
                 ) {
-                    IconButton(
-                        onClick = {
-                            clearSelection(keepSheetPosition = true)
-                            mapMyLocationRequest++
-                        }
-                    ) {
+                    Box(contentAlignment = Alignment.Center) {
                         Icon(
                             painterResource(R.drawable.navigation_24px),
                             contentDescription = "Show my location"
@@ -809,17 +848,25 @@ private fun FriendsMap(
     fitAllRequest: Int,
     sheetVisibleHeightPx: Float,
     mapCenterOffsetY: Int,
+    controlsVisible: Boolean,
     onFriendSelected: (Friend) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    val markerColor = Color.rgb(20, 30, 44)
-    val markerTextColor = Color.rgb(134, 166, 190)
-    val mapController = remember {
+    val topInsetPx = WindowInsets.statusBars.getTop(LocalDensity.current)
+
+    // OSM only ships light tiles, so the dark basemap is a colour matrix rather than a
+    // second tile server. Applied in update so flipping the setting re-themes the live
+    // map without rebuilding the view.
+    val darkMap = AppStatus.themeMode.collectAsState().value.isDark()
+
+    // Keyed on the theme: marker bitmaps are cached inside the controller, so a flip has
+    // to rebuild it or every pin keeps the old palette.
+    val mapController = remember(darkMap) {
         FriendsMapController(
             context.applicationContext,
-            markerColor,
-            markerTextColor,
+            mapMarkerBodyColor(darkMap),
+            mapMarkerRingColor(darkMap),
         )
     }
 
@@ -829,6 +876,9 @@ private fun FriendsMap(
             MapView(viewContext).apply {
                 setTileSource(TileSourceFactory.MAPNIK)
                 setMultiTouchControls(true)
+                // osmdroid's built-in +/- buttons fade in on every gesture; pinch and the
+                // in-app controls already cover zooming.
+                zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
                 minZoomLevel = 4.0
                 maxZoomLevel = 20.0
                 if (myLocation != null) {
@@ -840,6 +890,9 @@ private fun FriendsMap(
             }
         },
         update = { mapView ->
+            mapView.overlayManager.tilesOverlay.setColorFilter(
+                if (darkMap) DARK_MAP_COLOR_FILTER else null
+            )
             mapController.sync(
                 mapView = mapView,
                 friends = friends,
@@ -851,6 +904,8 @@ private fun FriendsMap(
                 fitAllRequest = fitAllRequest,
                 sheetVisibleHeightPx = sheetVisibleHeightPx,
                 mapCenterOffsetY = mapCenterOffsetY,
+                topInsetPx = topInsetPx,
+                controlsVisible = controlsVisible,
                 onFriendSelected = onFriendSelected,
             )
         }
@@ -866,12 +921,97 @@ private class FriendsMapController(
     private val friendIconCache = mutableMapOf<String, BitmapDrawable>()
     private var myLocation: Location? = null
     private var lastFriendSignature = ""
+    private var lastFriendsRef: List<Friend>? = null
+
+    // Cluster membership is binary — a pin joining a pair drops to 0.57x its size in one
+    // frame, and every change in member count steps again. No sizing formula can smooth
+    // that, so the drawn size chases the target instead of snapping to it.
+    private val faceSizeAnim = mutableMapOf<String, EaseState>()
+    private var sizeAnimating = false
+
+    private class EaseState(var cur: Float) {
+        var start = cur
+        var target = cur
+        var startAt = 0L
+    }
+
+    /**
+     * Retargets mid-flight from wherever the value currently is, so a merge interrupted
+     * by another merge glides on rather than snapping back to a new start.
+     */
+    private fun ease(state: EaseState, target: Float, durationMs: Long, epsilon: Float = 0.5f): Float {
+        val now = SystemClock.uptimeMillis()
+        if (kotlin.math.abs(target - state.target) > epsilon) {
+            state.start = state.cur
+            state.target = target
+            state.startAt = now
+        }
+        val elapsed = now - state.startAt
+        if (elapsed >= durationMs) {
+            state.cur = state.target
+            return state.cur
+        }
+        val t = (elapsed.toFloat() / durationMs).coerceIn(0f, 1f)
+        state.cur = state.start + (state.target - state.start) * easeInOutCubic(t)
+        sizeAnimating = true
+        return state.cur
+    }
+
+    /**
+     * Eases the pin's displacement from where it would sit un-clustered, never its
+     * absolute position. Panning moves the pin and its cluster centroid together, so the
+     * displacement holds steady and nothing lags; only a merge or split changes it.
+     */
+    private val faceOffsetAnim = mutableMapOf<String, Array<EaseState>>()
+
+    private fun easedOffset(handle: String, targetDx: Float, targetDy: Float): FloatArray {
+        val s = faceOffsetAnim.getOrPut(handle) {
+            arrayOf(EaseState(targetDx), EaseState(targetDy))
+        }
+        return floatArrayOf(
+            ease(s[0], targetDx, OFFSET_EASE_MS),
+            ease(s[1], targetDy, OFFSET_EASE_MS),
+        )
+    }
+
+    /**
+     * Eases the cluster's share of the pin size (1.0 alone, less as a face in a group),
+     * never the absolute size. The zoom ramp and the offscreen shrink are already smooth
+     * functions of the viewport, so they multiply through untouched and stay instant —
+     * only a change in cluster membership actually animates.
+     */
+    /**
+     * Slides a marker clear of the control column instead of teleporting it. The push
+     * ramps with vertical proximity to the buttons, so a pin travelling down the left
+     * edge eases out and back rather than popping sideways when it crosses their top.
+     */
+    private fun clearOfControls(x: Int, y: Int, halfSize: Int, rect: Rect?): Int {
+        if (rect == null) return x
+        val target = rect.right + halfSize + EDGE_AVATAR_MARGIN_PX
+        if (x >= target) return x
+        val dy = when {
+            y < rect.top -> (rect.top - y).toFloat()
+            y > rect.bottom -> (y - rect.bottom).toFloat()
+            else -> 0f
+        }
+        val reach = (halfSize + EDGE_AVATAR_MARGIN_PX).toFloat()
+        val nearness = (1f - dy / reach).coerceIn(0f, 1f)
+        if (nearness <= 0f) return x
+        return (x + (target - x) * nearness).roundToInt()
+    }
+
+    private fun easedClusterScale(handle: String, target: Float): Float {
+        val s = faceSizeAnim.getOrPut(handle) { EaseState(target) }
+        return ease(s, target, SIZE_EASE_MS, epsilon = 0.002f)
+    }
     private var lastSelectedHandle: String? = null
     private var lastSelectionRequest = -1
     private var lastSheetSnapRequest = -1
     private var lastMyLocationRequest = -1
     private var lastFitAllRequest = -1
     private var lastBottomInset = -1
+    private var lastTopInset = -1
+    private var controlsVisible = false
     private var lastMapCenterOffsetY = Int.MIN_VALUE
     private var followMyLocation = false
     private var avatarOverlayInstalled = false
@@ -897,25 +1037,37 @@ private class FriendsMapController(
         fitAllRequest: Int,
         sheetVisibleHeightPx: Float,
         mapCenterOffsetY: Int,
+        topInsetPx: Int,
+        controlsVisible: Boolean,
         onFriendSelected: (Friend) -> Unit,
     ) {
         installAvatarOverlay(mapView)
         this.onFriendSelected = onFriendSelected
+        this.controlsVisible = controlsVisible
         val bottomInset = sheetVisibleHeightPx.coerceAtLeast(76f).roundToInt() + 24
+        // Padding is what osmdroid frames bounding boxes inside, so reserving the status
+        // bar here keeps clusters and fit-all from packing pins up under it.
+        val topInset = topInsetPx + 24
         val mappedFriends = friends.filter { it.hasLocation }
-        val friendSignature = mappedFriends.joinToString("|") {
-            "${it.handle}:${it.lat}:${it.lon}:${it.name}:${it.photoUri}:${it.address}:${it.fullAddress}"
+        // sync now runs every frame of a sheet drag, so skip rebuilding the signature
+        // string when the caller handed us the same list instance it did last time.
+        val friendSignature = if (friends === lastFriendsRef) lastFriendSignature else {
+            mappedFriends.joinToString("|") {
+                "${it.handle}:${it.lat}:${it.lon}:${it.name}:${it.photoUri}:${it.address}:${it.fullAddress}"
+            }
         }
+        lastFriendsRef = friends
         val friendsChanged = friendSignature != lastFriendSignature
         val selectionChanged = selectedFriend?.handle != lastSelectedHandle
         val selectionRequested = selectionRequest != lastSelectionRequest
         val sheetSnapRequested = sheetSnapRequest != lastSheetSnapRequest
         val myLocationRequested = myLocationRequest != lastMyLocationRequest
         val fitAllRequested = fitAllRequest != lastFitAllRequest
-        val bottomInsetChanged = bottomInset != lastBottomInset
+        val bottomInsetChanged = bottomInset != lastBottomInset || topInset != lastTopInset
         if (bottomInsetChanged) {
-            mapView.setPadding(0, 0, 0, bottomInset)
+            mapView.setPadding(0, topInset, 0, bottomInset)
             lastBottomInset = bottomInset
+            lastTopInset = topInset
         }
         if (mapCenterOffsetY != lastMapCenterOffsetY) {
             mapView.setMapCenterOffset(0, mapCenterOffsetY)
@@ -994,11 +1146,24 @@ private class FriendsMapController(
 
     private fun drawFriendAvatars(canvas: AndroidCanvas, mapView: MapView) {
         drawnClusters.clear()
+        sizeAnimating = false
         val width = mapView.width
-        // Treat the area under the bottom sheet as offscreen too.
+        // Treat the area under the bottom sheet and the status bar as offscreen too, so
+        // edge-clamped pins cluster inside the visible strip rather than under them.
         val height = mapView.height - lastBottomInset.coerceAtLeast(0)
-        val baseSize = if (mapView.zoomLevelDouble >= 14.0) 192 else 144
-        if (width <= 0 || height <= 0) return
+        val topBound = lastTopInset.coerceAtLeast(0)
+        val baseSize = avatarBaseSize(mapView.zoomLevelDouble)
+        if (width <= 0 || height <= topBound) return
+
+        // Bottom-left control column, in the same coordinates as the pins. Mirrors the
+        // Compose layout: 12dp inset, 48dp square buttons, 8dp apart, riding the sheet.
+        val controlsRect = if (controlsVisible) {
+            val d = mapView.resources.displayMetrics.density
+            fun dp(v: Float) = (v * d).roundToInt()
+            val left = dp(12f)
+            val bottom = height - dp(12f)
+            Rect(left, bottom - dp(48f * 2 + 8f), left + dp(48f), bottom)
+        } else null
         val projection = mapView.projection ?: return
 
         // coerceIn that survives an inverted range (sheet dragged up can shrink the
@@ -1013,7 +1178,8 @@ private class FriendsMapController(
             val rawY: Int,
             val size: Int,
             val alpha: Int,
-            val offscreen: Boolean,
+            /** Drawn position differs from the true one, so it needs a direction arrow. */
+            val clamped: Boolean,
         )
 
         val point = Point()
@@ -1025,10 +1191,52 @@ private class FriendsMapController(
             projection.toPixels(GeoPoint(loc.latitude, loc.longitude), point)
             val phase = (SystemClock.uptimeMillis() % MY_LOCATION_PULSE_MS).toFloat() /
                 MY_LOCATION_PULSE_MS
-            myLocationPulsePaint.alpha = (90 * (1f - phase)).roundToInt()
-            canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 28f + phase * 70f, myLocationPulsePaint)
-            canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 28f, myLocationRingPaint)
-            canvas.drawCircle(point.x.toFloat(), point.y.toFloat(), 20f, myLocationDotPaint)
+            val offX = max(0, max(-point.x, point.x - width))
+            val offY = max(0, max(topBound - point.y, point.y - height))
+
+            // One drawing path for both states, with every quantity a continuous function
+            // of how far off-view the fix is: no branch means nothing can pop at the
+            // boundary. tEdge reaches the full edge look within a quarter viewport.
+            val screensOut = hypot(offX.toDouble(), offY.toDouble()) /
+                min(width, (height - topBound).coerceAtLeast(1))
+            val tEdge = min(1.0, screensOut * 4).toFloat()
+            val r = MY_LOCATION_RADIUS + (MY_LOCATION_EDGE_RADIUS - MY_LOCATION_RADIUS) * tEdge
+            val margin = r.roundToInt() + EDGE_AVATAR_MARGIN_PX
+            val ey = clamp(point.y, topBound + margin, height - margin)
+            val ex = clearOfControls(
+                clamp(point.x, margin, width - margin), ey, r.roundToInt(), controlsRect
+            )
+
+            myLocationPulsePaint.alpha = ((90 - 20 * tEdge) * (1f - phase)).roundToInt()
+            val pulseReach = 70f - 36f * tEdge
+            canvas.drawCircle(ex.toFloat(), ey.toFloat(), r + phase * pulseReach, myLocationPulsePaint)
+            canvas.drawCircle(ex.toFloat(), ey.toFloat(), r, myLocationRingPaint)
+            canvas.drawCircle(ex.toFloat(), ey.toFloat(), r * MY_LOCATION_DOT_RATIO, myLocationDotPaint)
+
+            // Keyed on displacement, not on leaving the viewport: the arrow's whole job is
+            // to say "the real fix is that way", which becomes true the instant clamping
+            // moves the dot off its true point. Growing with the displacement means it
+            // starts at zero size, so it appears without popping.
+            val towardX = point.x - ex.toFloat()
+            val towardY = point.y - ey.toFloat()
+            val displaced = hypot(towardX.toDouble(), towardY.toDouble()).toFloat()
+            if (displaced > 0.5f) {
+                val arrowT = min(1f, displaced / (EDGE_ARROW_LENGTH_PX * 2f))
+                val angleDeg =
+                    Math.toDegrees(atan2(towardY.toDouble(), towardX.toDouble())).toFloat()
+                // Base sits clear of the ring instead of overlapping it, so the arrow
+                // reads as a separate marker. Tip stays inside the clamp margin.
+                val base = r + MY_LOCATION_ARROW_GAP
+                arrowPath.reset()
+                arrowPath.moveTo(base + EDGE_ARROW_LENGTH_PX * arrowT, 0f)
+                arrowPath.lineTo(base, -EDGE_ARROW_LENGTH_PX * 0.6f * arrowT)
+                arrowPath.lineTo(base, EDGE_ARROW_LENGTH_PX * 0.6f * arrowT)
+                arrowPath.close()
+                canvas.withTranslation(ex.toFloat(), ey.toFloat()) {
+                    rotate(angleDeg)
+                    drawPath(arrowPath, myLocationDotPaint)
+                }
+            }
             mapView.postInvalidateDelayed(33L)
         }
 
@@ -1037,33 +1245,30 @@ private class FriendsMapController(
         friendsByHandle.values.forEach { friend ->
             projection.toPixels(GeoPoint(friend.lat!!, friend.lon!!), point)
             val offX = max(0, max(-point.x, point.x - width))
-            val offY = max(0, max(-point.y, point.y - height))
+            val offY = max(0, max(topBound - point.y, point.y - height))
             val offscreen = offX > 0 || offY > 0
 
             // Shrink and fade with distance in viewports: still full size and opacity
             // at the moment the pin sticks to the edge, so the transition is seamless.
-            val screensAway = hypot(offX.toDouble(), offY.toDouble()) / min(width, height)
+            val screensAway = hypot(offX.toDouble(), offY.toDouble()) /
+                min(width, (height - topBound).coerceAtLeast(1))
             val size = (baseSize / (1.0 + screensAway)).roundToInt()
                 .coerceAtLeast(EDGE_AVATAR_MIN_SIZE_PX)
             val alpha = 255 -
                 ((255 - EDGE_INDICATOR_MAX_ALPHA) * min(1.0, screensAway * 2)).roundToInt()
 
-            // Onscreen pins sit exactly on their location — never moved. Offscreen
-            // pins ease from their exact exit point into the margin band (room for
-            // the arrow), so the hand-off is continuous.
-            val x: Int
-            val y: Int
-            if (offscreen) {
-                val margin = size / 2 + EDGE_AVATAR_MARGIN_PX
-                val t = min(1.0, max(offX, offY).toDouble() / margin)
-                val startX = point.x.coerceIn(0, width)
-                val startY = point.y.coerceIn(0, height)
-                x = (startX + (clamp(point.x, margin, width - margin) - startX) * t).roundToInt()
-                y = (startY + (clamp(point.y, margin, height - margin) - startY) * t).roundToInt()
-            } else {
-                x = point.x
-                y = point.y
-            }
+            // Clamped into the band at all times rather than only once offscreen. A hard
+            // clamp is a continuous function, so a pin drifting out of view slides to a
+            // stop against the edge instead of sliding off and being pulled back — and it
+            // can never be drawn half outside the canvas. The cost is that a pin within
+            // one margin of the edge is nudged inward from its true point.
+            val margin = size / 2 + EDGE_AVATAR_MARGIN_PX
+            val y = clamp(point.y, topBound + margin, height - margin)
+            // The map control column sits in this same band at the bottom-left, so
+            // slide an edge hint clear of it rather than letting it hide underneath.
+            val x = clearOfControls(
+                clamp(point.x, margin, width - margin), y, size / 2, controlsRect
+            )
             val item = Item(
                 friend,
                 x,
@@ -1072,7 +1277,7 @@ private class FriendsMapController(
                 point.y,
                 size,
                 alpha,
-                offscreen,
+                clamped = x != point.x || y != point.y,
             )
             if (friend.handle == lastSelectedHandle && !offscreen) {
                 selectedOnscreen = item // drawn last, on top, as the callout
@@ -1092,15 +1297,17 @@ private class FriendsMapController(
         clusters.forEach { cluster ->
             val size = cluster.maxOf { it.size }
             val alpha = cluster.maxOf { it.alpha }
-            val offscreenGroup = cluster.any { it.offscreen }
+            // Arrow follows displacement, not "left the viewport": a group parked against
+            // the edge band is already lying about where its members are.
+            val offscreenGroup = cluster.any { it.clamped }
 
-            var cx = cluster.sumOf { it.x } / cluster.size
-            var cy = cluster.sumOf { it.y } / cluster.size
-            if (offscreenGroup) {
-                val margin = size / 2 + EDGE_AVATAR_MARGIN_PX
-                cx = clamp(cx, margin, width - margin)
-                cy = clamp(cy, margin, height - margin)
-            }
+            // Clamped unconditionally, same as the members, so the group disc can never be
+            // drawn partly outside the canvas either.
+            val margin = size / 2 + EDGE_AVATAR_MARGIN_PX
+            val cx = clamp(cluster.sumOf { it.x } / cluster.size, margin, width - margin)
+            val cy = clamp(
+                cluster.sumOf { it.y } / cluster.size, topBound + margin, height - margin
+            )
             val left = cx - size / 2
             val top = cy - size / 2
 
@@ -1118,10 +1325,20 @@ private class FriendsMapController(
             arrowPaint.alpha = 255
 
             if (cluster.size == 1) {
+                val only = cluster[0]
+                // Alone: full share of the pin size, so this eases back up after a split.
+                val drawn = (size * easedClusterScale(only.friend.handle, 1f)).roundToInt()
+                // Zero displacement for a lone pin, so a member leaving a cluster eases
+                // back to its own position rather than snapping there.
+                val off = easedOffset(
+                    only.friend.handle, (cx - only.x).toFloat(), (cy - only.y).toFloat()
+                )
+                val dl = (only.x + off[0] - drawn / 2f).roundToInt()
+                val dt = (only.y + off[1] - drawn / 2f).roundToInt()
                 canvas.drawBitmap(
-                    avatarIconFor(cluster[0].friend, baseSize).bitmap,
+                    avatarIconFor(only.friend).bitmap,
                     null,
-                    Rect(left, top, left + size, top + size),
+                    Rect(dl, dt, dl + drawn, dt + drawn),
                     avatarPaint
                 )
             } else {
@@ -1132,12 +1349,21 @@ private class FriendsMapController(
                     rawX = IntArray(n) { cluster[it].rawX },
                     rawY = IntArray(n) { cluster[it].rawY },
                 ).forEach { face ->
-                    val l = (cx + face.x - face.size / 2.0).roundToInt()
-                    val t = (cy + face.y - face.size / 2.0).roundToInt()
+                    val member = cluster[face.member]
+                    val drawn = (size * easedClusterScale(
+                        member.friend.handle, face.size.toFloat() / size
+                    )).roundToInt()
+                    val off = easedOffset(
+                        member.friend.handle,
+                        (cx + face.x - member.x).toFloat(),
+                        (cy + face.y - member.y).toFloat(),
+                    )
+                    val l = (member.x + off[0] - drawn / 2f).roundToInt()
+                    val t = (member.y + off[1] - drawn / 2f).roundToInt()
                     canvas.drawBitmap(
-                        avatarIconFor(cluster[face.member].friend, baseSize).bitmap,
+                        avatarIconFor(member.friend).bitmap,
                         null,
-                        Rect(l, t, l + face.size, t + face.size),
+                        Rect(l, t, l + drawn, t + drawn),
                         avatarPaint
                     )
                 }
@@ -1171,26 +1397,38 @@ private class FriendsMapController(
         // Selected friend keeps the callout look, anchored on its true position.
         selectedOnscreen?.let { item ->
             val friend = item.friend
-            val key = "${friend.handle}|$baseSize|true|${friend.photoUri}|${friend.name}"
+            val key = "${friend.handle}|$AVATAR_ICON_RENDER_PX|true|${friend.photoUri}|${friend.name}"
             val icon = friendIconCache.getOrPut(key) {
-                selectedFriendMarkerIcon(context, friend, markerColor, baseSize)
+                selectedFriendMarkerIcon(context, friend, markerColor, AVATAR_ICON_RENDER_PX)
             }
+            // Drawn size follows the zoom ramp, with the callout's aspect taken from the
+            // bitmap so the stem and dot stay in proportion at every size.
+            val calloutWidth = baseSize
+            val calloutHeight =
+                (calloutWidth * icon.bitmap.height.toFloat() / icon.bitmap.width).roundToInt()
             val dst = Rect(
-                item.rawX - icon.bitmap.width / 2,
-                item.rawY - icon.bitmap.height,
-                item.rawX + icon.bitmap.width / 2,
+                item.rawX - calloutWidth / 2,
+                item.rawY - calloutHeight,
+                item.rawX + calloutWidth / 2,
                 item.rawY,
             )
             avatarPaint.alpha = 255
             canvas.drawBitmap(icon.bitmap, null, dst, avatarPaint)
             drawnClusters.add(dst to listOf(friend))
         }
+
+        // Only while a size is still settling, so a static map stays at zero frames.
+        if (sizeAnimating) mapView.postInvalidateDelayed(16L)
     }
 
-    private fun avatarIconFor(friend: Friend, size: Int): BitmapDrawable {
-        val key = "${friend.handle}|$size|false|${friend.photoUri}|${friend.name}"
+    // One resolution for every avatar; callers scale the bitmap into place, so the size
+    // is no longer a parameter and the cache key no longer varies by it.
+    private fun avatarIconFor(friend: Friend): BitmapDrawable {
+        val key = "${friend.handle}|false|${friend.photoUri}|${friend.name}"
         return friendIconCache.getOrPut(key) {
-            friendPhotoMarkerIcon(context, friend, markerColor, markerTextColor, size)
+            friendPhotoMarkerIcon(
+                context, friend, markerColor, markerTextColor, AVATAR_ICON_RENDER_PX
+            )
         }
     }
 
@@ -1369,7 +1607,9 @@ fun friendPhotoMarkerIcon(
         }
     }
     val label = (friend.name ?: friend.handle).trim().firstOrNull()?.uppercase() ?: "?"
-    return contactCircleBitmap(photo, label, markerColor, markerTextColor, size)
+    // Resolved here rather than passed in, so every caller (in-app map and widgets) gets
+    // the same treatment without another colour argument threaded through.
+    return contactCircleBitmap(photo, label, markerColor, markerTextColor, size, isDarkTheme(context))
         .toDrawable(context.resources)
 }
 
@@ -1387,7 +1627,7 @@ fun selectedFriendMarkerIcon(
         }
     }
     val label = (friend.name ?: friend.handle).trim().firstOrNull()?.uppercase() ?: "?"
-    return selectedContactCalloutBitmap(photo, label, markerColor, avatarSize)
+    return selectedContactCalloutBitmap(photo, label, markerColor, avatarSize, isDarkTheme(context))
         .toDrawable(context.resources)
 }
 
@@ -1396,6 +1636,7 @@ private fun selectedContactCalloutBitmap(
     label: String,
     markerColor: Int,
     avatarSize: Int,
+    dimPhoto: Boolean = false,
 ): Bitmap {
     val contrastColor = Color.rgb(116, 148, 174)
     val dotFillColor = markerColor
@@ -1421,12 +1662,12 @@ private fun selectedContactCalloutBitmap(
         val scaled = it.scale(avatarPixels, avatarPixels)
         val clip = Path().apply { addOval(avatarRect, Path.Direction.CW) }
         canvas.withClip(clip) {
-            drawBitmap(scaled, avatarRect.left, avatarRect.top, null)
+            drawBitmap(scaled, avatarRect.left, avatarRect.top, dimPhotoPaint(dimPhoto))
         }
     } ?: run {
         paint.color = Color.rgb(235, 241, 247)
         canvas.drawOval(avatarRect, paint)
-        paint.color = markerColor
+        paint.color = MARKER_INK
         paint.textAlign = Paint.Align.CENTER
         paint.textSize = avatarSize * 0.42f
         paint.isFakeBoldText = true
@@ -1461,12 +1702,20 @@ private fun selectedContactCalloutBitmap(
     return bitmap
 }
 
+/** Reused for every avatar draw; null keeps the original fast path untouched. */
+private val dimPhotoPaintInstance = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+    colorFilter = DIM_PHOTO_COLOR_FILTER
+}
+
+private fun dimPhotoPaint(dim: Boolean): Paint? = if (dim) dimPhotoPaintInstance else null
+
 private fun contactCircleBitmap(
     photo: Bitmap?,
     label: String,
     markerColor: Int,
     markerTextColor: Int,
     size: Int,
+    dimPhoto: Boolean = false,
 ): Bitmap {
     val bitmap = createBitmap(size, size)
     val canvas = AndroidCanvas(bitmap)
@@ -1483,12 +1732,12 @@ private fun contactCircleBitmap(
         val scaled = it.scale(avatarSize, avatarSize)
         val clip = Path().apply { addOval(avatarRect, Path.Direction.CW) }
         canvas.withClip(clip) {
-            drawBitmap(scaled, inset, inset, null)
+            drawBitmap(scaled, inset, inset, dimPhotoPaint(dimPhoto))
         }
     } ?: run {
         paint.color = Color.WHITE
         canvas.drawOval(avatarRect, paint)
-        paint.color = markerColor
+        paint.color = MARKER_INK
         paint.textAlign = Paint.Align.CENTER
         paint.textSize = size * 0.42f
         paint.isFakeBoldText = true
@@ -1650,7 +1899,7 @@ private fun FriendsSheetHeader(
     ) {
         Column {
             Text("Friends", style = MaterialTheme.typography.titleLarge)
-            lastPushedLabel(lastPushedAtMillis)?.let {
+            lastPushedLabel(lastPushedAtMillis, rememberTimeTick())?.let {
                 Text(
                     text = it,
                     style = MaterialTheme.typography.bodySmall,
@@ -1682,7 +1931,7 @@ private fun FriendDetailSheet(
         ?: if (friend.hasLocation)"No address from server (%.5f, %.5f)".format(friend.lat, friend.lon)
         else null
     val longAddress = friend.fullAddress?.replace("\n", ", ")
-    val time = if (friend.timestamp > 0) relativeTime(friend.timestamp) else null
+    val time = if (friend.timestamp > 0) relativeTime(friend.timestamp, rememberTimeTick()) else null
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
@@ -1774,7 +2023,7 @@ private fun FriendRow(
     modifier: Modifier = Modifier,
 ) {
     val place = friend.address ?: friend.fullAddress?.replace("\n", ", ")
-    val time = if (friend.timestamp > 0) relativeTime(friend.timestamp) else null
+    val time = if (friend.timestamp > 0) relativeTime(friend.timestamp, rememberTimeTick()) else null
     val subtitle = if (friend.hasLocation) {
         listOfNotNull(place, time).joinToString(" · ")
     } else {

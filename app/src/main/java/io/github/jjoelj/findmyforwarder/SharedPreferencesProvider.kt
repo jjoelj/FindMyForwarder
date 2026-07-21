@@ -15,12 +15,12 @@ class SharedPreferencesProvider(context: Context) {
         const val PREFS_KEY_LAST_SENT_LAT = "last_sent_lat"
         const val PREFS_KEY_LAST_SENT_LON = "last_sent_lon"
         const val PREFS_KEY_LAST_SENT_AT = "last_sent_at"
-        const val PREFS_KEY_IS_FORWARDING_ENABLED = "is_forwarding_enabled"
         const val PREFS_KEY_LAST_ACTIVITY_NAME = "last_activity_name"
+        const val PREFS_KEY_THEME_MODE = "theme_mode"
         const val DEFAULT_NEARBY_RADIUS_MILES = 25
     }
 
-    private val sharedPreferences: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+    private val sharedPreferences: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     var forwardUrl: String
         get() = sharedPreferences.getString(PREFS_KEY_FORWARD_URL, "") ?: ""
@@ -60,6 +60,11 @@ class SharedPreferencesProvider(context: Context) {
         get() = sharedPreferences.getString(PREFS_KEY_LAST_ACTIVITY_NAME, null)
         set(value) = sharedPreferences.edit { putString(PREFS_KEY_LAST_ACTIVITY_NAME, value) }
 
+    /** Shared by the app and every widget; widgets re-render on change. */
+    var themeMode: ThemeMode
+        get() = ThemeMode.from(sharedPreferences.getString(PREFS_KEY_THEME_MODE, null))
+        set(value) = sharedPreferences.edit { putString(PREFS_KEY_THEME_MODE, value.name) }
+
     /** Which friend a SingleFriendWidget instance tracks, keyed by app-widget id. */
     fun widgetFriendHandle(widgetId: Int): String? =
         sharedPreferences.getString("widget_friend_$widgetId", null)
@@ -77,8 +82,4 @@ class SharedPreferencesProvider(context: Context) {
         if (miles == null) remove("nearby_radius_miles_$widgetId")
         else putInt("nearby_radius_miles_$widgetId", miles)
     }
-
-    var isForwardingEnabled: Boolean
-        get() = sharedPreferences.getBoolean(PREFS_KEY_IS_FORWARDING_ENABLED, false)
-        set(value) = sharedPreferences.edit { putBoolean(PREFS_KEY_IS_FORWARDING_ENABLED, value) }
 }
