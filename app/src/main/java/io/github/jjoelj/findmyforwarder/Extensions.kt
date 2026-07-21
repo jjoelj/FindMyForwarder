@@ -9,7 +9,12 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ScrollState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
@@ -21,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.ActivityTransition
 import com.google.android.gms.location.DetectedActivity
+import kotlin.time.Duration.Companion.milliseconds
 
 fun Int?.getActivityName(): String {
     return when (this) {
@@ -110,10 +116,29 @@ fun startActivityRecognition(context: Context) {
 }
 
 /** "Location sent 12 min. ago" for the last successful push, or null if never pushed. */
-fun lastPushedLabel(atMillis: Long): String? {
+fun lastPushedLabel(atMillis: Long, nowMillis: Long = System.currentTimeMillis()): String? {
     if (atMillis <= 0) return null
-    return if (System.currentTimeMillis() - atMillis < 60_000) "Location sent just now"
-    else "Location sent ${DateUtils.getRelativeTimeSpanString(atMillis)}"
+    return if (nowMillis - atMillis < 60_000) "Location sent just now"
+    else "Location sent ${
+        DateUtils.getRelativeTimeSpanString(atMillis, nowMillis, DateUtils.MINUTE_IN_MILLIS)
+    }"
+}
+
+/**
+ * Wall-clock value that changes on a timer, so relative labels ("Now" -> "1 min ago")
+ * age while the screen stays open instead of waiting for the next unrelated recompose.
+ * Pass it into relativeTime/lastPushedLabel — reading it is what creates the dependency.
+ */
+@Composable
+fun rememberTimeTick(periodMillis: Long = 30_000L): Long {
+    var tick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(periodMillis) {
+        while (true) {
+            delay(periodMillis.milliseconds)
+            tick = System.currentTimeMillis()
+        }
+    }
+    return tick
 }
 
 fun resetLocation(context: Context) {

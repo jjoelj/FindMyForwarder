@@ -27,6 +27,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Icon
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -81,7 +84,8 @@ class MainActivity : ComponentActivity() {
         startActivityRecognition(this)
 
         setContent {
-            FindMyForwarderTheme {
+            val themeMode by AppStatus.themeMode.collectAsState()
+            FindMyForwarderTheme(darkTheme = themeMode.isDark()) {
                 FindMyForwarderApp()
             }
         }
@@ -216,6 +220,7 @@ fun StatusScreen(modifier: Modifier = Modifier) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        val now = rememberTimeTick()
         Text("Status", style = MaterialTheme.typography.titleLarge)
         StatusCard(
             "Forwarding",
@@ -232,7 +237,7 @@ fun StatusScreen(modifier: Modifier = Modifier) {
         StatusCard(
             "Activity",
             listOfNotNull(status.currentActivity, status.currentTransition).joinToString(" · ").ifBlank { "No activity yet" },
-            formatStatusTime(status.lastActivityAtMillis),
+            formatStatusTime(status.lastActivityAtMillis, now),
             state = if (status.currentActivity != null) StatusTone.Good else StatusTone.Neutral
         )
         StatusCard(
@@ -240,7 +245,7 @@ fun StatusScreen(modifier: Modifier = Modifier) {
             if (status.lastLocationLat != null && status.lastLocationLon != null) {
                 "%.5f, %.5f".format(status.lastLocationLat, status.lastLocationLon)
             } else "No location yet",
-            formatStatusTime(status.lastLocationAtMillis),
+            formatStatusTime(status.lastLocationAtMillis, now),
             state = if (status.lastLocationLat != null && status.lastLocationLon != null) {
                 StatusTone.Good
             } else {
@@ -255,7 +260,7 @@ fun StatusScreen(modifier: Modifier = Modifier) {
                 status.batteryCharging?.let { if (it) "Charging" else "Not charging" },
                 status.batteryExternalPower?.let { if (it) "External power" else "Battery power" },
                 status.batteryMessage,
-                formatStatusTime(status.batteryAtMillis).takeIf { it != "Never" },
+                formatStatusTime(status.batteryAtMillis, now).takeIf { it != "Never" },
             ).joinToString(" · ").ifBlank { "Waiting for battery status" },
             state = when {
                 statusBatteryPercent == null -> StatusTone.Neutral
@@ -371,8 +376,8 @@ fun parseLogLines(log: String): List<ParsedLogLine> =
         }
         .toList()
 
-fun formatStatusTime(millis: Long): String =
-    if (millis <= 0L) "Never" else relativeTime(millis / 1000)
+fun formatStatusTime(millis: Long, nowMillis: Long = System.currentTimeMillis()): String =
+    if (millis <= 0L) "Never" else relativeTime(millis / 1000, nowMillis)
 
 enum class StatusTone { Good, Bad, Neutral }
 
@@ -419,6 +424,7 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         ForwardingSettings()
+        AppearanceSettings()
         PermissionsStatus()
         Button(
             onClick = { resetLocation(context) },
@@ -426,6 +432,36 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
         ) {
             Text(text = "Send Current Location")
         }
+    }
+}
+
+@Composable
+private fun AppearanceSettings() {
+    val context = LocalContext.current
+    val selected by AppStatus.themeMode.collectAsState()
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(text = "Appearance", style = MaterialTheme.typography.titleMedium)
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            ThemeMode.entries.forEachIndexed { index, mode ->
+                SegmentedButton(
+                    selected = mode == selected,
+                    onClick = {
+                        SharedPreferencesProvider(context).themeMode = mode
+                        AppStatus.setThemeMode(mode)
+                        // Widgets read the pref at render time, so they need a nudge.
+                        MapWidget.requestUpdate(context)
+                    },
+                    shape = SegmentedButtonDefaults.itemShape(index, ThemeMode.entries.size)
+                ) {
+                    Text(mode.label)
+                }
+            }
+        }
+        Text(
+            text = "Applies to the app, the map tiles and every widget.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 

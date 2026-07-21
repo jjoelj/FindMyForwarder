@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Static stand-in for a rendered map snapshot, used only by the widget picker previews.
+  A vector rather than a screenshot so it stays sharp at any picker size and does not
+  have to be re-captured whenever the real widget rendering changes.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="120dp"
+    android:height="120dp"
+    android:viewportWidth="120"
+    android:viewportHeight="120">
+
+    <path
+        android:fillColor="#141E2C"
+        android:pathData="M0,0h120v120h-120z" />
+
+    <!-- roads -->
+    <path
+        android:strokeColor="#22314A"
+        android:strokeWidth="7"
+        android:pathData="M-10,86 L38,58 L74,74 L130,44" />
+    <path
+        android:strokeColor="#22314A"
+        android:strokeWidth="5"
+        android:pathData="M22,-10 L34,44 L18,130" />
+    <path
+        android:strokeColor="#1C2942"
+        android:strokeWidth="4"
+        android:pathData="M92,-10 L86,52 L112,96" />
+
+    <!-- water -->
+    <path
+        android:fillColor="#16273D"
+        android:pathData="M78,104 q18,-16 42,-10 L120,120 L74,120 z" />
+
+    <!-- other people -->
+    <path
+        android:fillColor="#7C6BF0"
+        android:pathData="M30,50m-6,0a6,6 0,1 1,12 0a6,6 0,1 1,-12 0" />
+    <path
+        android:fillColor="#7C6BF0"
+        android:pathData="M96,80m-6,0a6,6 0,1 1,12 0a6,6 0,1 1,-12 0" />
+
+    <!-- you -->
+    <group
+        android:scaleX="1.5"
+        android:scaleY="1.5"
+        android:translateX="42"
+        android:translateY="26">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M12,2C8.13,2 5,5.13 5,9c0,5.25 7,13 7,13s7,-7.75 7,-13c0,-3.87 -3.13,-7 -7,-7zM12,11.5c-1.38,0 -2.5,-1.12 -2.5,-2.5s1.12,-2.5 2.5,-2.5 2.5,1.12 2.5,2.5 -1.12,2.5 -2.5,2.5z" />
+    </group>
+</vector>

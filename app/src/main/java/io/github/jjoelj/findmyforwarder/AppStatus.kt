@@ -27,6 +27,15 @@ object AppStatus {
     private val _state = MutableStateFlow(StatusState())
     val state: StateFlow<StatusState> = _state
 
+    // Separate from StatusState: this is a user setting, not observed device status, and
+    // it is seeded from prefs at startup so the first frame already has the right theme.
+    private val _themeMode = MutableStateFlow(ThemeMode.SYSTEM)
+    val themeMode: StateFlow<ThemeMode> = _themeMode
+
+    fun setThemeMode(mode: ThemeMode) {
+        _themeMode.value = mode
+    }
+
     fun setServiceRunning(running: Boolean) {
         _state.value = _state.value.copy(serviceRunning = running)
     }

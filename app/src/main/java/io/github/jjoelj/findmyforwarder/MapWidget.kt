@@ -261,6 +261,9 @@ open class MapWidget : AppWidgetProvider() {
             try {
                 if (s.status == MapSnapshot.Status.CANVAS_OK) {
                     val bitmap = s.bitmap.copy(Bitmap.Config.ARGB_8888, true)
+                    // Same matrix the in-app map uses, applied to the tiles only —
+                    // drawPins runs afterwards so markers keep their real colours.
+                    if (isDarkTheme(context)) darkenMapTiles(bitmap)
                     drawPins(
                         context, bitmap, projection, friends, myPoint, focusedFriend, focusedPinSize
                     )
@@ -348,6 +351,18 @@ open class MapWidget : AppWidgetProvider() {
             attachClicks(this, context, javaClass, widgetId)
         }
 
+    /**
+     * Repaints the snapshot in place through the shared dark-map matrix. Draws from a
+     * throwaway copy because a Canvas reading and writing the same bitmap is undefined.
+     */
+    private fun darkenMapTiles(bitmap: Bitmap) {
+        val source = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        Canvas(bitmap).drawBitmap(
+            source, 0f, 0f, Paint().apply { colorFilter = DARK_MAP_COLOR_FILTER }
+        )
+        source.recycle()
+    }
+
     private fun drawPins(
         context: Context,
         bitmap: Bitmap,
@@ -371,8 +386,12 @@ open class MapWidget : AppWidgetProvider() {
                 Pin(friend, point.x, point.y) else null
         }
         val avatarPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        // Matches the in-app map: a near-black pin body disappears against dark tiles.
+        val dark = isDarkTheme(context)
+        val pinColor = mapMarkerBodyColor(dark)
+        val pinRingColor = mapMarkerRingColor(dark)
         fun icon(friend: Friend) =
-            friendPhotoMarkerIcon(context, friend, PIN_COLOR, PIN_TEXT_COLOR, size).bitmap
+            friendPhotoMarkerIcon(context, friend, pinColor, pinRingColor, size).bitmap
 
         clusterByProximity(pins, { it.x }, { it.y }, { size }).forEach { cluster ->
             val cx = cluster.sumOf { it.x } / cluster.size
@@ -418,7 +437,7 @@ open class MapWidget : AppWidgetProvider() {
         focusedFriend?.let { friend ->
             projection.toPixels(GeoPoint(friend.lat!!, friend.lon!!), point)
             val icon = selectedFriendMarkerIcon(
-                context, friend, PIN_COLOR, focusedPinSize
+                context, friend, pinColor, focusedPinSize
             ).bitmap
             canvas.drawBitmap(
                 icon, null,
@@ -441,8 +460,6 @@ open class MapWidget : AppWidgetProvider() {
         private const val FOCUSED_PIN_SIZE_PX = 192
         private const val SELECTED_CALLOUT_HEIGHT_SCALE = 1.55
         private const val FOCUSED_PIN_TOP_MARGIN_PX = 12
-        private val PIN_COLOR = Color.rgb(20, 30, 44)
-        private val PIN_TEXT_COLOR = Color.rgb(134, 166, 190)
 
         private fun loadingViews(
             context: Context,

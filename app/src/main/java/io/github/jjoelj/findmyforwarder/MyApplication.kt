@@ -12,6 +12,7 @@ class MyApplication : Application() {
         Configuration.getInstance().load(this, getSharedPreferences("osmdroid", MODE_PRIVATE))
         Configuration.getInstance().userAgentValue = packageName
         val prefs = SharedPreferencesProvider(this)
+        AppStatus.setThemeMode(prefs.themeMode)
         val lat = prefs.lastSentLat.toDoubleOrNull()
         val lon = prefs.lastSentLon.toDoubleOrNull()
         if (lat != null && lon != null) {
