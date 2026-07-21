@@ -6,11 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.os.Build
-import android.text.format.DateFormat
-import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
-import java.util.Date
 
 class NotificationProvider(private val context: Context) {
 
@@ -30,16 +26,16 @@ class NotificationProvider(private val context: Context) {
             pendingIntentFlags
         )
 
-        val lastUploaded = SharedPreferencesProvider(context).lastPushedAtMillis.takeIf { it > 0L }
-            ?.let { DateFormat.getTimeFormat(context).format(Date(it)) }
-            ?: "Never"
         val activityText = "Detected Activity: ${activityName ?: "Unknown"}"
-        val uploadText = "Last uploaded: $lastUploaded"
+        val lastUploaded = SharedPreferencesProvider(context).lastPushedAtMillis.takeIf { it > 0L }
+            ?: System.currentTimeMillis()
         val notification = NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("Find My Forwarder")
             .setContentText(activityText)
-            .setSubText(uploadText)
-            .setStyle(NotificationCompat.BigTextStyle().bigText("$activityText\n$uploadText"))
+            .setWhen(lastUploaded)
+            .setShowWhen(true)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
@@ -51,7 +47,7 @@ class NotificationProvider(private val context: Context) {
     fun createNotificationChannel() {
         val channel = NotificationChannel(NOTIFICATION_CHANNEL_ID,
             "Location Update Service Channel",
-            NotificationManager.IMPORTANCE_DEFAULT
+            NotificationManager.IMPORTANCE_LOW
         )
 
         channel.enableVibration(false)

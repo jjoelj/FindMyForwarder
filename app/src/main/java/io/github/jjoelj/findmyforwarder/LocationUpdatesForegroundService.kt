@@ -41,13 +41,9 @@ class LocationUpdatesForegroundService : Service() {
         const val EXTRA_ACTIVITY_TYPE = "EXTRA_ACTIVITY_TYPE"
         const val EXTRA_TRANSITION_TYPE = "EXTRA_TRANSITION_TYPE"
 
-        fun isRunning() = isServiceInForeground
-
         @Volatile
         private var isServiceInForeground = false
     }
-
-    private var locationUpdatesRequested = false
 
     override fun onBind(intent: Intent?): IBinder? {
         return null
@@ -112,7 +108,11 @@ class LocationUpdatesForegroundService : Service() {
                     AppStatus.setPostResult(response.isSuccessful, "HTTP ${response.code}")
                     if (response.isSuccessful) {
                         prefs.lastPushedAtMillis = System.currentTimeMillis()
-                        notificationProvider.updateNotification(prefs.lastActivityName)
+                        // Don't resurrect a dismissed notif: STILL enter stops the service
+                        // while this upload is still in flight.
+                        if (isServiceInForeground) {
+                            notificationProvider.updateNotification(prefs.lastActivityName)
+                        }
                     }
                     response.isSuccessful
                 }
@@ -126,14 +126,27 @@ class LocationUpdatesForegroundService : Service() {
     // Everything here is synchronous and ordered — the previous GlobalScope.launch per
     // intent let coroutines from back-to-back transitions interleave, which could
     // re-post the notification after a STILL stop.
-    @RequiresPermission(Manifest.permission.ACTIVITY_RECOGNITION)
+    // COARSE rather than FINE: that is what checkAllPermissions actually verifies before
+    // anything starts us, and it satisfies the anyOf on the location APIs below.
+    @RequiresPermission(
+        allOf = [Manifest.permission.ACTIVITY_RECOGNITION, Manifest.permission.ACCESS_COARSE_LOCATION]
+    )
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notification = notificationProvider.createNotification(prefs.lastActivityName)
-        startForeground(
-            NotificationProvider.NOTIFICATION_ID,
-            notification,
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-        )
+        try {
+            startForeground(
+                NotificationProvider.NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            )
+        } catch (t: Throwable) {
+            // Android 15+ bars location-type foreground services started from
+            // BOOT_COMPLETED, and rejects them here rather than at startForegroundService.
+            // Bail quietly; the widget refresh or the first real transition starts us.
+            FileLogger.e("startForeground rejected: ${t.message}", t)
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         if (!isServiceInForeground) {
             isServiceInForeground = true
@@ -149,11 +162,12 @@ class LocationUpdatesForegroundService : Service() {
                 sendCurrentLocation()
             }
         }
-        // NOT_STICKY: a sticky restart redelivers a null intent, leaving a zombie
-        // foreground service showing the last saved activity. Transitions restart us.
-        return START_NOT_STICKY
+        // STICKY now that idling in the foreground is the resting state: a null-intent
+        // restart just re-parks us there, keeping the process out of the cached bucket.
+        return START_STICKY
     }
 
+    @RequiresPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
     private fun handleActivityTransition(intent: Intent) {
         val activityType = intent.getIntExtra(EXTRA_ACTIVITY_TYPE, -1)
         val transitionType = intent.getIntExtra(EXTRA_TRANSITION_TYPE, -1)
@@ -163,23 +177,28 @@ class LocationUpdatesForegroundService : Service() {
         FileLogger.i("Received ACTIVITY_TRANSITION_ACTION - Activity: $activityName, Transition: $transitionName")
         AppStatus.setActivity(activityName, transitionName)
 
+        // Single source of truth for the notification text: postLocation and
+        // onStartCommand both rebuild it from prefs.lastActivityName, so anything not
+        // written here gets overwritten. "Still" included — it's the resting state now
+        // that the service no longer stops.
+        if (transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER) {
+            prefs.lastActivityName = activityName
+            notificationProvider.updateNotification(activityName)
+        }
+
         if (activityType == DetectedActivity.STILL) {
-            // Don't persist or show "Still" — we're stopping; saving it would make the
-            // next cold start's notification say "Still" before the real activity arrives.
+            // Stay in the foreground with location updates off instead of stopping. A
+            // process with no running FGS goes cached, and Android defers broadcasts to
+            // cached processes — the next transition would sit in the queue until the
+            // user opened the app, which is exactly the wake-up bug.
             if (transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER) {
-                // Post the final resting location; sendCurrentLocation's completion
-                // then stops the service via stopIfIdle().
                 stopLocationUpdates()
                 sendCurrentLocation()
             }
             return
         }
 
-        prefs.lastActivityName = activityName
-        notificationProvider.updateNotification(activityName)
-
         if (transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER) {
-            locationUpdatesRequested = true
             fusedLocationProviderClient.requestLocationUpdates(
                 buildLocationRequest(activityType),
                 locationCallback,
@@ -240,6 +259,7 @@ class LocationUpdatesForegroundService : Service() {
         AppStatus.setLastLocation(latitude, longitude, now)
     }
 
+    @RequiresPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
     private fun sendCurrentLocation() {
         val currentLocationRequest = CurrentLocationRequest.Builder()
             .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
@@ -254,32 +274,13 @@ class LocationUpdatesForegroundService : Service() {
                 } else {
                     FileLogger.w("Current location is null.")
                 }
-                stopIfIdle()
             }
             .addOnFailureListener {
                 FileLogger.e("Failed to get current location: ${it.message}")
-                stopIfIdle()
             }
     }
 
-    // A one-shot RESET_LOCATION_ACTION must not leave the service parked in the
-    // foreground with a stale "Detected Activity" notification.
-    private fun stopIfIdle() {
-        if (!locationUpdatesRequested) {
-            stopForeground()
-        }
-    }
-
-    private fun stopForeground() {
-        stopLocationUpdates()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-        isServiceInForeground = false
-        AppStatus.setServiceRunning(false)
-    }
-
     private fun stopLocationUpdates() {
-        locationUpdatesRequested = false
         fusedLocationProviderClient.removeLocationUpdates(locationCallback).addOnFailureListener {
             FileLogger.e("Failed to stop location updates: ${it.message}")
         }.addOnSuccessListener {
@@ -290,6 +291,6 @@ class LocationUpdatesForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        client.dispatcher.executorService.shutdown();
+        client.dispatcher.executorService.shutdown()
     }
 }
