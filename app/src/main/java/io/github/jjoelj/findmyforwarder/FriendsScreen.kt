@@ -86,7 +86,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -96,6 +95,12 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.drawable.toDrawable
+import androidx.core.graphics.scale
+import androidx.core.graphics.withClip
+import androidx.core.graphics.withTranslation
+import androidx.core.net.toUri
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -117,6 +122,7 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlin.math.absoluteValue
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.sin
@@ -176,6 +182,11 @@ fun parseFriends(body: String): List<Friend> {
     return List(arr.length()) { i ->
         val o = arr.getJSONObject(i)
         fun str(key: String) = if (o.isNull(key)) null else o.getString(key)
+        // Coords but no address means the server geocoded nothing; log the raw entry so
+        // it's clear this is their bug, not ours.
+        if (!o.isNull("lat") && str("address").isNullOrBlank() && str("fullAddress").isNullOrBlank()) {
+            FileLogger.w("Server sent coords with no address: $o")
+        }
         Friend(
             handle = o.getString("handle"),
             lat = if (o.isNull("lat")) null else o.getDouble("lat"),
@@ -482,11 +493,11 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         if (!configured) return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             launch {
-                delay(FRIENDS_AUTO_REFRESH_DELAY_MILLIS)
+                delay(FRIENDS_AUTO_REFRESH_DELAY_MILLIS.milliseconds)
                 if (!refreshedThisVisit) refresh()
             }
             while (isActive) {
-                delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS)
+                delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS.milliseconds)
                 if (loading) continue
                 try {
                     applyFetchedFriends(fetchFriends(context))
@@ -659,7 +670,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                     val elapsedMillis = System.currentTimeMillis() - fetchStartedAt
                     val remainingDelay = ACTIVE_FRIEND_FETCH_INTERVAL_MILLIS - elapsedMillis
                     if (remainingDelay > 0) {
-                        delay(remainingDelay)
+                        delay(remainingDelay.milliseconds)
                     }
                 }
             }
@@ -1148,11 +1159,10 @@ private class FriendsMapController(
                     arrowPath.lineTo(half - 2f, -EDGE_ARROW_LENGTH_PX * 0.6f)
                     arrowPath.lineTo(half - 2f, EDGE_ARROW_LENGTH_PX * 0.6f)
                     arrowPath.close()
-                    canvas.save()
-                    canvas.translate(cx.toFloat(), cy.toFloat())
-                    canvas.rotate(angleDeg)
-                    canvas.drawPath(arrowPath, arrowPaint)
-                    canvas.restore()
+                    canvas.withTranslation(cx.toFloat(), cy.toFloat()) {
+                        rotate(angleDeg)
+                        drawPath(arrowPath, arrowPaint)
+                    }
                 }
             }
             if (faded) canvas.restore()
@@ -1163,7 +1173,7 @@ private class FriendsMapController(
             val friend = item.friend
             val key = "${friend.handle}|$baseSize|true|${friend.photoUri}|${friend.name}"
             val icon = friendIconCache.getOrPut(key) {
-                selectedFriendMarkerIcon(context, friend, markerColor, markerTextColor, baseSize)
+                selectedFriendMarkerIcon(context, friend, markerColor, baseSize)
             }
             val dst = Rect(
                 item.rawX - icon.bitmap.width / 2,
@@ -1353,49 +1363,45 @@ fun friendPhotoMarkerIcon(
 ): BitmapDrawable {
     val photo = friend.photoUri?.let { uri ->
         try {
-            context.contentResolver.openInputStream(Uri.parse(uri))?.use(BitmapFactory::decodeStream)
-        } catch (e: Exception) {
+            context.contentResolver.openInputStream(uri.toUri())?.use(BitmapFactory::decodeStream)
+        } catch (_: Exception) {
             null
         }
     }
     val label = (friend.name ?: friend.handle).trim().firstOrNull()?.uppercase() ?: "?"
-    return BitmapDrawable(
-        context.resources,
-        contactCircleBitmap(photo, label, markerColor, markerTextColor, size)
-    )
+    return contactCircleBitmap(photo, label, markerColor, markerTextColor, size)
+        .toDrawable(context.resources)
 }
 
 fun selectedFriendMarkerIcon(
     context: Context,
     friend: Friend,
     markerColor: Int,
-    markerTextColor: Int,
     avatarSize: Int,
 ): BitmapDrawable {
     val photo = friend.photoUri?.let { uri ->
         try {
-            context.contentResolver.openInputStream(Uri.parse(uri))?.use(BitmapFactory::decodeStream)
-        } catch (e: Exception) {
+            context.contentResolver.openInputStream(uri.toUri())?.use(BitmapFactory::decodeStream)
+        } catch (_: Exception) {
             null
         }
     }
     val label = (friend.name ?: friend.handle).trim().firstOrNull()?.uppercase() ?: "?"
-    val bitmap = selectedContactCalloutBitmap(photo, label, markerColor, markerTextColor, avatarSize)
-    return BitmapDrawable(context.resources, bitmap)
+    return selectedContactCalloutBitmap(photo, label, markerColor, avatarSize)
+        .toDrawable(context.resources)
 }
 
 private fun selectedContactCalloutBitmap(
     photo: Bitmap?,
     label: String,
     markerColor: Int,
-    markerTextColor: Int,
     avatarSize: Int,
 ): Bitmap {
     val contrastColor = Color.rgb(116, 148, 174)
     val dotFillColor = markerColor
     val width = avatarSize
     val height = (avatarSize * 1.55f).roundToInt()
-    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val bitmap = createBitmap(width, height)
     val canvas = AndroidCanvas(bitmap)
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     val center = width / 2f
@@ -1412,12 +1418,11 @@ private fun selectedContactCalloutBitmap(
     }
     photo?.let {
         val avatarPixels = (avatarRect.width()).roundToInt()
-        val scaled = Bitmap.createScaledBitmap(it, avatarPixels, avatarPixels, true)
+        val scaled = it.scale(avatarPixels, avatarPixels)
         val clip = Path().apply { addOval(avatarRect, Path.Direction.CW) }
-        canvas.save()
-        canvas.clipPath(clip)
-        canvas.drawBitmap(scaled, avatarRect.left, avatarRect.top, null)
-        canvas.restore()
+        canvas.withClip(clip) {
+            drawBitmap(scaled, avatarRect.left, avatarRect.top, null)
+        }
     } ?: run {
         paint.color = Color.rgb(235, 241, 247)
         canvas.drawOval(avatarRect, paint)
@@ -1463,7 +1468,7 @@ private fun contactCircleBitmap(
     markerTextColor: Int,
     size: Int,
 ): Bitmap {
-    val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val bitmap = createBitmap(size, size)
     val canvas = AndroidCanvas(bitmap)
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     val center = size / 2f
@@ -1475,12 +1480,11 @@ private fun contactCircleBitmap(
     val avatarRect = RectF(inset, inset, size - inset, size - inset)
     photo?.let {
         val avatarSize = (size - inset * 2).roundToInt()
-        val scaled = Bitmap.createScaledBitmap(it, avatarSize, avatarSize, true)
+        val scaled = it.scale(avatarSize, avatarSize)
         val clip = Path().apply { addOval(avatarRect, Path.Direction.CW) }
-        canvas.save()
-        canvas.clipPath(clip)
-        canvas.drawBitmap(scaled, inset, inset, null)
-        canvas.restore()
+        canvas.withClip(clip) {
+            drawBitmap(scaled, inset, inset, null)
+        }
     } ?: run {
         paint.color = Color.WHITE
         canvas.drawOval(avatarRect, paint)
@@ -1673,7 +1677,10 @@ private fun FriendDetailSheet(
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
-    val place = friend.address
+    // Distinguishes "no fix at all" from "we have a fix, the server just didn't name it".
+    val place = friend.address?.takeIf { it.isNotBlank() }
+        ?: if (friend.hasLocation)"No address from server (%.5f, %.5f)".format(friend.lat, friend.lon)
+        else null
     val longAddress = friend.fullAddress?.replace("\n", ", ")
     val time = if (friend.timestamp > 0) relativeTime(friend.timestamp) else null
 
@@ -1740,11 +1747,11 @@ private fun FriendDetailSheet(
                     val label = Uri.encode(friend.name ?: friend.handle)
                     val geo = "google.navigation:q=${friend.lat},${friend.lon}($label)"
                     try {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(geo)))
-                    } catch (e: Exception) {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, geo.toUri()))
+                    } catch (_: Exception) {
                         val fallback = "geo:${friend.lat},${friend.lon}?q=${friend.lat},${friend.lon}($label)"
                         try {
-                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(fallback)))
+                            context.startActivity(Intent(Intent.ACTION_VIEW, fallback.toUri()))
                         } catch (inner: Exception) {
                             FileLogger.w("No maps app available: ${inner.message}")
                         }
@@ -1816,16 +1823,16 @@ private fun FriendRow(
 }
 
 @Composable
-private fun ContactAvatar(friend: Friend, modifier: Modifier = Modifier.size(40.dp)) {
+private fun ContactAvatar(friend: Friend, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val photo by produceState<ImageBitmap?>(initialValue = null, friend.photoUri) {
         value = friend.photoUri?.let { uri ->
             withContext(Dispatchers.IO) {
                 try {
-                    context.contentResolver.openInputStream(Uri.parse(uri))?.use {
+                    context.contentResolver.openInputStream(uri.toUri())?.use {
                         BitmapFactory.decodeStream(it)?.asImageBitmap()
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     null
                 }
             }
@@ -1833,7 +1840,10 @@ private fun ContactAvatar(friend: Friend, modifier: Modifier = Modifier.size(40.
     }
 
     Box(
-        modifier = modifier
+        // 40.dp stays the fallback, but comes first so a caller-supplied size wins.
+        modifier = Modifier
+            .size(40.dp)
+            .then(modifier)
             .clip(CircleShape)
             .background(MaterialTheme.colorScheme.primaryContainer),
         contentAlignment = Alignment.Center

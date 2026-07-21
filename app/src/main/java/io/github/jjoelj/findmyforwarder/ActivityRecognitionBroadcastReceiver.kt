@@ -3,9 +3,7 @@ package io.github.jjoelj.findmyforwarder
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import com.google.android.gms.location.ActivityTransition
 import com.google.android.gms.location.ActivityTransitionResult
-import com.google.android.gms.location.DetectedActivity
 
 class ActivityRecognitionBroadcastReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -22,13 +20,6 @@ class ActivityRecognitionBroadcastReceiver : BroadcastReceiver() {
         val event = ActivityTransitionResult.extractResult(intent)?.transitionEvents?.lastOrNull()
         if (event == null) {
             FileLogger.w("No transition events found in ActivityTransitionResult")
-            return
-        }
-
-        val isStillEnter = event.activityType == DetectedActivity.STILL &&
-                event.transitionType == ActivityTransition.ACTIVITY_TRANSITION_ENTER
-        if (isStillEnter && !LocationUpdatesForegroundService.isRunning()) {
-            FileLogger.i("STILL enter while service not running; nothing to do.")
             return
         }
 

@@ -33,6 +33,7 @@ import java.util.Date
 import kotlin.concurrent.thread
 import kotlin.math.min
 import kotlin.math.roundToInt
+import androidx.core.net.toUri
 
 /**
  * "Large Map" home-screen widget: a static snapshot of the map zoomed out to
@@ -417,7 +418,7 @@ open class MapWidget : AppWidgetProvider() {
         focusedFriend?.let { friend ->
             projection.toPixels(GeoPoint(friend.lat!!, friend.lon!!), point)
             val icon = selectedFriendMarkerIcon(
-                context, friend, PIN_COLOR, PIN_TEXT_COLOR, focusedPinSize
+                context, friend, PIN_COLOR, focusedPinSize
             ).bitmap
             canvas.drawBitmap(
                 icon, null,
@@ -511,7 +512,7 @@ open class MapWidget : AppWidgetProvider() {
 
         /** Extras are not part of PendingIntent identity; this URI is. */
         private fun widgetIntentUri(providerClass: Class<*>, widgetId: Int, action: String): Uri =
-            Uri.parse("findmyforwarder://widget/${providerClass.name}/$widgetId/$action")
+            "findmyforwarder://widget/${providerClass.name}/$widgetId/$action".toUri()
 
         private fun setLoading(
             context: Context,
