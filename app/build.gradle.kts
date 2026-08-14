@@ -1,5 +1,3 @@
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -15,14 +13,29 @@ android {
         applicationId = "io.github.jjoelj.findmyforwarder"
         minSdk = 33
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        // CI passes the tag through; local builds stay on 1/1.0.
+        versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
+        versionName = System.getenv("VERSION_NAME") ?: "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        System.getenv("KEYSTORE_FILE")?.let { keystore ->
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            // No keystore in the environment (i.e. a local build) — fall back to the debug
+            // key so assembleRelease still installs. CI fails if the secret is missing.
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -36,6 +49,11 @@ android {
     }
     buildFeatures {
         compose = true
+    }
+    testOptions {
+        // FriendsScreen.kt has top-level android.graphics constants; without this every
+        // JVM test that touches the file dies in <clinit> on "Color.rgb not mocked".
+        unitTests.isReturnDefaultValues = true
     }
 }
 

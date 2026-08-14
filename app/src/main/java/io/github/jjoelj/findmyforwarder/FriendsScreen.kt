@@ -358,13 +358,12 @@ suspend fun fetchFriends(context: Context, handle: String? = null): List<Friend>
 
     val request = Request.Builder()
         .url(url)
-        .addHeader("skip_zrok_interstitial", "1")
         .get()
         .build()
 
     friendsClient.newCall(request).execute().use { response ->
         when {
-            response.code == 403 -> throw IOException("Invalid token")
+            response.code == 403 -> throw IOException("Token rejected — scan the QR code again")
             !response.isSuccessful -> throw IOException("HTTP ${response.code}")
         }
         val body = response.body.string()
@@ -389,12 +388,11 @@ suspend fun refreshFriends(context: Context, handle: String? = null): List<Frien
 
     val request = Request.Builder()
         .url(url)
-        .addHeader("skip_zrok_interstitial", "1")
         .get()
         .build()
 
     friendsRefreshClient.newCall(request).execute().use { response ->
-        if (response.code == 403) throw IOException("Invalid token")
+        if (response.code == 403) throw IOException("Token rejected — scan the QR code again")
         if (response.code == 409) {
             FileLogger.i("Friends location refresh already in progress")
             return@withContext emptyList()

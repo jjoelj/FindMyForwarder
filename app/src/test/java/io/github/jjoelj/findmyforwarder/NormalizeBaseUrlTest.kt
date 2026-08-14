@@ -17,4 +17,24 @@ class NormalizeBaseUrlTest {
         assertNull(normalizeBaseUrl("ftp://example.com"))
         assertNull(normalizeBaseUrl("not a url"))
     }
+
+    @Test
+    fun splitsScannedPayload() {
+        val token = "0123456789abcdef0123456789abcdef"
+        assertEquals(
+            "https://iphone.tail1234.ts.net" to token,
+            parseScannedCredentials("https://iphone.tail1234.ts.net/?token=$token", "https://old.example.com")
+        )
+        // Bare token: keep whatever base URL is already configured.
+        assertEquals(
+            "https://old.example.com" to token,
+            parseScannedCredentials(token, "https://old.example.com")
+        )
+        // Non-default port survives; default 443 does not come back.
+        assertEquals(
+            "http://192.168.1.5:8080" to token,
+            parseScannedCredentials("http://192.168.1.5:8080/?token=$token", "")
+        )
+        assertNull(parseScannedCredentials("https://", ""))
+    }
 }

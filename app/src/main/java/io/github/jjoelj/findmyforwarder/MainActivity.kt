@@ -295,13 +295,15 @@ suspend fun fetchBatteryStatus(context: android.content.Context) {
         }
         val request = Request.Builder()
             .url(url)
-            .addHeader("skip_zrok_interstitial", "1")
             .get()
             .build()
         try {
             statusClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    AppStatus.setBattery(null, null, null, "HTTP ${response.code}")
+                    val message =
+                        if (response.code == 403) "Token rejected — scan the QR code again"
+                        else "HTTP ${response.code}"
+                    AppStatus.setBattery(null, null, null, message)
                     return@withContext
                 }
                 val battery = parseBatteryStatus(response.body.string())
@@ -478,6 +480,22 @@ fun normalizeBaseUrl(input: String): String? {
     return s.toHttpUrlOrNull()?.toString()?.trimEnd('/')
 }
 
+/**
+ * Splits a scanned QR payload into base URL and token. Codes now carry the whole
+ * endpoint (https://host/?token=…), but a phone with Tailscale disconnected still
+ * emits a bare token, in which case the configured base URL is kept.
+ * Returns null if the payload looks like a URL but cannot be parsed.
+ */
+fun parseScannedCredentials(scanned: String, existingBaseUrl: String): Pair<String, String>? {
+    val s = scanned.trim()
+    if (!s.startsWith("http", ignoreCase = true)) return existingBaseUrl to s
+    val url = s.toHttpUrlOrNull() ?: return null
+    // Keeps scheme, host and any non-default port; drops the payload's own path and query.
+    val base = url.newBuilder().encodedPath("/").query(null).fragment(null)
+        .build().toString().trimEnd('/')
+    return base to url.queryParameter("token").orEmpty()
+}
+
 fun maskToken(token: String): String =
     if (token.length > 8) "••••••••" + token.takeLast(4) else "••••••••"
 
@@ -536,8 +554,15 @@ fun ForwardingSettings() {
                                 .build()
                             GmsBarcodeScanning.getClient(context, options).startScan()
                                 .addOnSuccessListener { barcode ->
-                                    barcode.rawValue?.trim()?.takeIf { it.isNotBlank() }
-                                        ?.let { tokenInput = it }
+                                    val scanned = barcode.rawValue?.trim().orEmpty()
+                                    if (scanned.isBlank()) return@addOnSuccessListener
+                                    val parsed = parseScannedCredentials(scanned, urlInput)
+                                    if (parsed == null) {
+                                        FileLogger.e("Scanned QR code is not a valid endpoint URL")
+                                        return@addOnSuccessListener
+                                    }
+                                    urlInput = parsed.first
+                                    tokenInput = parsed.second
                                 }
                                 .addOnFailureListener {
                                     FileLogger.e("QR scan failed: ${it.message}")
