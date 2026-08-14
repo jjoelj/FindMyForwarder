@@ -13,9 +13,9 @@ android {
         applicationId = "io.github.jjoelj.findmyforwarder"
         minSdk = 33
         targetSdk = 36
-        // CI passes the tag through; local builds stay on 1/1.0.
+        // CI passes the run number and tag through; local builds are 1/dev.
         versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
-        versionName = System.getenv("VERSION_NAME") ?: "1.0"
+        versionName = System.getenv("VERSION_NAME") ?: "dev"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
