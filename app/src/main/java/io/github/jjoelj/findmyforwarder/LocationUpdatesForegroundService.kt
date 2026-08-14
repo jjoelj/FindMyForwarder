@@ -99,7 +99,6 @@ class LocationUpdatesForegroundService : Service() {
 
             val request = Request.Builder()
                 .url(url)
-                .addHeader("skip_zrok_interstitial", "1")
                 .get()
                 .build()
 
@@ -107,7 +106,12 @@ class LocationUpdatesForegroundService : Service() {
                 client.newCall(request).execute().use { response ->
                     val body = response.body.string()
                     FileLogger.i(body)
-                    AppStatus.setPostResult(response.isSuccessful, "HTTP ${response.code}")
+                    AppStatus.setPostResult(
+                        response.isSuccessful,
+                        // A regenerated token kills the old one instantly; retrying never helps.
+                        if (response.code == 403) "Token rejected — scan the QR code again"
+                        else "HTTP ${response.code}"
+                    )
                     if (response.isSuccessful) {
                         prefs.lastPushedAtMillis = System.currentTimeMillis()
                         // Don't resurrect a dismissed notif: STILL enter stops the service
