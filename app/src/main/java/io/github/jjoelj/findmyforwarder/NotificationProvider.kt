@@ -26,7 +26,9 @@ class NotificationProvider(private val context: Context) {
             pendingIntentFlags
         )
 
-        val activityText = "Detected Activity: ${activityName ?: "Unknown"}"
+        // Null until the first transition arrives; "Unknown" read as a fault.
+        val activityText = activityName?.let { "Detected Activity: $it" }
+            ?: "No activity detected yet"
         val lastUploaded = SharedPreferencesProvider(context).lastPushedAtMillis.takeIf { it > 0L }
             ?: System.currentTimeMillis()
         val notification = NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_ID)
