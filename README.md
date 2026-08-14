@@ -86,22 +86,7 @@ Nothing is sent anywhere except the base URL you configure.
 ```
 
 Local builds are signed with the debug key and versioned `dev`, so they install
-but are obviously not releases.
-
-Pushing a `v*` tag builds a signed APK and publishes it to Releases.
-`versionName` comes from the tag, `versionCode` from the run number. Signing
-needs three repository secrets and one variable:
-
-| Name | | Value |
-| --- | --- | --- |
-| `KEYSTORE_BASE64` | secret | The keystore, base64-encoded |
-| `KEYSTORE_PASSWORD` | secret | Its password |
-| `KEY_PASSWORD` | secret | Same password (PKCS12 requires it) |
-| `KEY_ALIAS` | variable | Alias of the key inside the keystore |
-
-Keep that keystore backed up. Android only accepts an update signed with the key
-that signed the installed build, so losing it means every user has to uninstall
-and reinstall.
+but are obviously not releases. Tagged releases are built and signed by CI.
 
 ## License
 
