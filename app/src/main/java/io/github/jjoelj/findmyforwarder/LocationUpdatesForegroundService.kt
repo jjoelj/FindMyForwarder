@@ -41,8 +41,6 @@ class LocationUpdatesForegroundService : Service() {
         const val EXTRA_ACTIVITY_TYPE = "EXTRA_ACTIVITY_TYPE"
         const val EXTRA_TRANSITION_TYPE = "EXTRA_TRANSITION_TYPE"
 
-        fun isRunning() = isServiceInForeground
-
         @Volatile
         private var isServiceInForeground = false
     }
@@ -59,6 +57,11 @@ class LocationUpdatesForegroundService : Service() {
         fusedLocationProviderClient =
             LocationServices.getFusedLocationProviderClient(applicationContext)
         notificationProvider.createNotificationChannel()
+
+        // The service outlives the activity, so this is the only re-registration path that
+        // survives a process restart the user never sees. No-op once this process holds an
+        // acked registration, so the sticky-restart case is covered without extra cost.
+        startActivityRecognition(applicationContext)
 
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(locationResult: LocationResult) {

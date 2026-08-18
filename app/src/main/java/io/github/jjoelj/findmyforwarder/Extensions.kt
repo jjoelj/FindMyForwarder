@@ -107,10 +107,11 @@ fun startActivityRecognition(context: Context) {
         return
     }
     // Play Services echoes the current activity back the instant you register, so
-    // re-registering on every app open costs a GPS fix and a POST for nothing. A running
-    // service already implies a live registration; boot and package-replace both reach
-    // here with it stopped, so they still register.
-    if (LocationUpdatesForegroundService.isRunning()) return
+    // re-registering costs a GPS fix and a POST — skip it once this process holds a
+    // registration Play Services acked. Deliberately not isRunning(): STILL now parks the
+    // service in the foreground for good, so that guard was permanently true and nothing
+    // could ever re-register after a dropped or never-made registration.
+    if (AppStatus.state.value.activityRecognitionActive) return
     ActivityRecognitionProvider(context.applicationContext)
         .startActivityTransitionRecognitionWithBroadcast()
 }
