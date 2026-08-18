@@ -80,15 +80,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Idempotent re-registration; the safety net for lost Play Services registrations.
-        startActivityRecognition(this)
-
         setContent {
             val themeMode by AppStatus.themeMode.collectAsState()
             FindMyForwarderTheme(darkTheme = themeMode.isDark()) {
                 FindMyForwarderApp()
             }
         }
+    }
+
+    // onResume, not onCreate: on a fresh install ACTIVITY_RECOGNITION is still ungranted
+    // when onCreate runs, so registration was skipped and only retried on a new process.
+    // Granting it from the in-app Permissions card returns here.
+    override fun onResume() {
+        super.onResume()
+        startActivityRecognition(this)
     }
 }
 

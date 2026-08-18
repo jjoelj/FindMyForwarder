@@ -99,11 +99,7 @@
 
         <receiver
             android:name=".ActivityRecognitionBroadcastReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="com.google.android.gms.location.ACTIVITY_TRANSITION" />
-            </intent-filter>
-        </receiver>
+            android:exported="false" />
 
         <receiver
             android:name=".BootCompletedReceiver"
