@@ -2035,7 +2035,6 @@ private fun FriendDetailSheet(
         TextButton(
             onClick = {
                 if (friend.hasLocation) {
-                    val label = Uri.encode(friend.name ?: friend.handle)
                     // Hand the route to the maps app's own task and reuse the screen that's
                     // already there. Unflagged, each tap stacks another maps activity on our
                     // task, so leaving means backing out through every friend ever tapped.
@@ -2047,10 +2046,10 @@ private fun FriendDetailSheet(
                         )
                     )
                     try {
-                        open("google.navigation:q=${friend.lat},${friend.lon}($label)")
+                        open("google.navigation:q=${friend.lat},${friend.lon}")
                     } catch (_: Exception) {
                         try {
-                            open("geo:${friend.lat},${friend.lon}?q=${friend.lat},${friend.lon}($label)")
+                            open("geo:${friend.lat},${friend.lon}?q=${friend.lat},${friend.lon}")
                         } catch (inner: Exception) {
                             FileLogger.w("No maps app available: ${inner.message}")
                         }
