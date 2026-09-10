@@ -196,8 +196,13 @@ data class Friend(
     val valid: Boolean,
     val name: String? = null,
     val photoUri: String? = null,
+    val aliases: List<String> = emptyList(),
+    val followsMe: Boolean = false,
 ) {
     val hasLocation get() = valid && lat != null && lon != null
+
+    /** Every handle this person answers to. Find My shares per handle, not per person. */
+    val handles get() = (listOf(handle) + aliases).distinct()
 }
 
 /** Phone handles keep a leading + and digits only; emails compare lowercased. */
@@ -233,17 +238,26 @@ fun parseFriends(body: String): List<Friend> {
     }
 }
 
-/** Same person can appear under several handles/devices; keep the best fix each. */
+/**
+ * Same person can appear under several handles/devices; keep the best fix each, and the
+ * other handles as aliases so sharing can be turned off on all of them at once. Without
+ * contacts permission there are no names to group by, so an email and a phone number for
+ * one person stay two rows and two independent shares.
+ */
 fun dedupeFriends(friends: List<Friend>): List<Friend> =
     friends.groupBy { it.name ?: normalizeHandle(it.handle) }
         .map { (_, entries) ->
-            entries.sortedWith(compareBy({ it.valid }, { it.timestamp })).last()
+            val best = entries.sortedWith(compareBy({ it.valid }, { it.timestamp })).last()
+            best.copy(
+                aliases = entries.flatMap { it.handles }.filterNot { it == best.handle }.distinct(),
+                followsMe = entries.any { it.followsMe },
+            )
         }
         .sortedBy { (it.name ?: it.handle).lowercase() }
 
-private data class ContactInfo(val name: String?, val photoUri: String?)
+internal data class ContactInfo(val name: String?, val photoUri: String?)
 
-private fun resolveContact(context: Context, handle: String): ContactInfo = try {
+internal fun resolveContact(context: Context, handle: String): ContactInfo = try {
     val n = normalizeHandle(handle)
     val email = "@" in n
     val uri = if (email) {
@@ -313,7 +327,7 @@ fun formatMiles(from: Location, lat: Double, lon: Double): String {
 }
 
 // The iPhone refreshes its cache independently; /friends returns the latest server cache.
-private val friendsClient = OkHttpClient.Builder()
+internal val friendsClient = OkHttpClient.Builder()
     .readTimeout(25, TimeUnit.SECONDS)
     .callTimeout(30, TimeUnit.SECONDS)
     .build()
@@ -323,7 +337,7 @@ private val friendsRefreshClient = OkHttpClient.Builder()
     .callTimeout(50, TimeUnit.SECONDS)
     .build()
 
-private fun friendsUrl(
+internal fun friendsUrl(
     prefs: SharedPreferencesProvider,
     path: String,
     handle: String? = null,
@@ -526,6 +540,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
     LaunchedEffect(configured, lifecycleOwner) {
         if (!configured) return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            launch { Following.refresh(context) }
             launch {
                 delay(FRIENDS_AUTO_REFRESH_DELAY_MILLIS.milliseconds)
                 if (!refreshedThisVisit) refresh()
@@ -533,6 +548,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
             while (isActive) {
                 delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS.milliseconds)
                 if (loading) continue
+                Following.refresh(context)
                 try {
                     applyFetchedFriends(fetchFriends(context))
                 } catch (e: Exception) {
@@ -573,9 +589,32 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val sortedFriends = remember(friends, myLocation) {
-        val loc = myLocation ?: return@remember friends
-        friends.sortedBy {
+    val following by Following.handles.collectAsState()
+    var followerRows by remember { mutableStateOf(emptyList<Friend>()) }
+    LaunchedEffect(friends, following) {
+        followerRows = followerOnlyFriends(context, friends, following.orEmpty())
+    }
+    val allFriends = remember(friends, followerRows) {
+        if (followerRows.isEmpty()) friends else dedupeFriends(friends + followerRows)
+    }
+
+    // selectedFriend is a snapshot, and both refresh paths rebuild it from raw /friends —
+    // which has no follower-only aliases. Render the detail sheet from the merged list so
+    // the sharing switch always sees every handle this person answers to.
+    val detailFriend = remember(allFriends, selectedFriend) {
+        val selected = selectedFriend ?: return@remember null
+        val merged = allFriends.firstOrNull { candidate ->
+            candidate.handles.any { normalizeHandle(it) == normalizeHandle(selected.handle) }
+        } ?: return@remember selected
+        merged.copy(
+            name = merged.name ?: selected.name,
+            photoUri = merged.photoUri ?: selected.photoUri,
+        )
+    }
+
+    val sortedFriends = remember(allFriends, myLocation) {
+        val loc = myLocation ?: return@remember allFriends
+        allFriends.sortedBy {
             if (it.hasLocation) distanceMeters(loc, it.lat!!, it.lon!!)
             else Float.MAX_VALUE
         }
@@ -715,7 +754,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         FriendsMap(
             friends = sortedFriends,
             myLocation = myLocation,
-            selectedFriend = selectedFriend,
+            selectedFriend = detailFriend,
             selectionRequest = mapSelectionRequest,
             sheetSnapRequest = mapSheetSnapRequest,
             myLocationRequest = mapMyLocationRequest,
@@ -808,7 +847,7 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
             loadedOnce = loadedOnce,
             error = error,
             friends = sortedFriends,
-            selectedFriend = selectedFriend,
+            selectedFriend = detailFriend,
             myLocation = myLocation,
             lastPushedAtMillis = lastPushedAtMillis,
             refreshingHandles = refreshingHandles,
@@ -1909,6 +1948,11 @@ private fun FriendsSheetHeader(
             if (loading) {
                 CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
             }
+            var addOpen by remember { mutableStateOf(false) }
+            IconButton(onClick = { addOpen = true }, enabled = configured) {
+                Icon(painterResource(R.drawable.add_24px), contentDescription = "Share with someone")
+            }
+            if (addOpen) AddSharingFlow(onDone = { addOpen = false })
             IconButton(onClick = onRefresh, enabled = configured && !loading) {
                 Icon(painterResource(R.drawable.refresh_24px), contentDescription = "Refresh")
             }
@@ -1992,13 +2036,21 @@ private fun FriendDetailSheet(
             onClick = {
                 if (friend.hasLocation) {
                     val label = Uri.encode(friend.name ?: friend.handle)
-                    val geo = "google.navigation:q=${friend.lat},${friend.lon}($label)"
+                    // Hand the route to the maps app's own task and reuse the screen that's
+                    // already there. Unflagged, each tap stacks another maps activity on our
+                    // task, so leaving means backing out through every friend ever tapped.
+                    fun open(uri: String) = context.startActivity(
+                        Intent(Intent.ACTION_VIEW, uri.toUri()).addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        )
+                    )
                     try {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, geo.toUri()))
+                        open("google.navigation:q=${friend.lat},${friend.lon}($label)")
                     } catch (_: Exception) {
-                        val fallback = "geo:${friend.lat},${friend.lon}?q=${friend.lat},${friend.lon}($label)"
                         try {
-                            context.startActivity(Intent(Intent.ACTION_VIEW, fallback.toUri()))
+                            open("geo:${friend.lat},${friend.lon}?q=${friend.lat},${friend.lon}($label)")
                         } catch (inner: Exception) {
                             FileLogger.w("No maps app available: ${inner.message}")
                         }
@@ -2009,6 +2061,7 @@ private fun FriendDetailSheet(
         ) {
             Text("Navigate")
         }
+        SharingToggle(friend)
     }
 }
 
@@ -2024,6 +2077,8 @@ private fun FriendRow(
     val time = if (friend.timestamp > 0) relativeTime(friend.timestamp, rememberTimeTick()) else null
     val subtitle = if (friend.hasLocation) {
         listOfNotNull(place, time).joinToString(" · ")
+    } else if (place == null && friend.followsMe) {
+        "You're sharing with them"
     } else {
         listOfNotNull(place?.let { "Near $it" } ?: "Location unavailable", time)
             .joinToString(" · ")

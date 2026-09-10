@@ -50,6 +50,81 @@ class FriendsTest {
     }
 
     @Test
+    fun keepsEveryHandleOfOnePersonAsAliases() {
+        val email = Friend("a@example.com", 1.0, 2.0, null, null, 50, valid = true, name = "Alice")
+        val phone = Friend("+12025550101", null, null, null, null, 10, valid = false, name = "Alice")
+        val deduped = dedupeFriends(listOf(email, phone))
+        assertEquals(1, deduped.size)
+        assertEquals(
+            setOf("a@example.com", "+12025550101"),
+            deduped[0].handles.toSet()
+        )
+    }
+
+    @Test
+    fun parsesFollowingVerbatim() {
+        val following = parseFollowing(
+            """{"ok":true,"following":["A@Example.com","+1 202-555-0101"]}"""
+        )
+        // Kept verbatim — /unshare only accepts the server's own spelling.
+        assertEquals(listOf("A@Example.com", "+1 202-555-0101"), following)
+        assertEquals(true, following.hasHandle("a@example.com"))
+        assertEquals(true, following.hasHandle("+12025550101"))
+        assertEquals(false, following.hasHandle("someone@example.com"))
+    }
+
+    @Test
+    fun followerOnlyHandlesSkipsHandlesAlreadyOnAFriend() {
+        val friend = Friend(
+            "a@example.com", 1.0, 2.0, null, null, 50, valid = true,
+            aliases = listOf("+12025550101")
+        )
+        assertEquals(
+            listOf("stranger@example.com"),
+            followerOnlyHandles(
+                listOf(friend),
+                listOf("A@Example.com", "+1 202-555-0101", "stranger@example.com")
+            )
+        )
+    }
+
+    @Test
+    fun followerRowFoldsOntoTheSameContact() {
+        val friend = Friend(
+            "a@example.com", 1.0, 2.0, null, null, 50, valid = true, name = "Alice"
+        )
+        val followerOnly = Friend(
+            "+12025550101", null, null, null, null, 0, valid = false,
+            name = "Alice", followsMe = true
+        )
+        val merged = dedupeFriends(listOf(friend, followerOnly))
+        assertEquals(1, merged.size)
+        // The friend's fix survives, the extra alias comes along, and the row still knows
+        // they can see me — which is what the sharing switch turns off on both handles.
+        assertEquals(true, merged[0].hasLocation)
+        assertEquals(true, merged[0].followsMe)
+        assertEquals(
+            setOf("a@example.com", "+12025550101"),
+            merged[0].handles.toSet()
+        )
+    }
+
+    @Test
+    fun rejectsHandlesThatAreNeitherEmailNorPhone() {
+        assertEquals(true, handleLooksValid("a@example.com"))
+        assertEquals(true, handleLooksValid("+1 202-555-0101"))
+        assertEquals(false, handleLooksValid("Alice"))
+        assertEquals(false, handleLooksValid("555"))
+    }
+
+    @Test
+    fun oldServerReportsSharingUnsupported() {
+        assertThrows(SharingUnsupportedException::class.java) {
+            parseFollowing("""{"ok":false,"message":"not found"}""")
+        }
+    }
+
+    @Test
     fun parsesSingleFriendResponse() {
         val friends = parseFriends(
             """

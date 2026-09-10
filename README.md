@@ -52,6 +52,14 @@ Everything is plain `GET` requests with the token as a query parameter:
 | `/friends?token=` | Read the server's cached Find My friend locations |
 | `/friends/refresh?token=` | Force the phone to re-read Find My, then return the result |
 | `/battery?token=` | iPhone battery level, charging state, external power |
+| `/following?token=` | Handles that can currently see your location |
+| `/share?token=&handle=` | Start sharing your location with a handle |
+| `/unshare?token=&handle=` | Stop sharing with a handle |
+
+Sharing needs LocationSpoofServer v0.3.0; older servers 404 those three and the app hides
+the switch. Find My keys a share to one handle, so a friend with both an email and a phone
+number is two shares — the app turns off every handle it knows for that person, which it
+can only group by contact name, so grant contacts access if you use both.
 
 ## In the app
 
