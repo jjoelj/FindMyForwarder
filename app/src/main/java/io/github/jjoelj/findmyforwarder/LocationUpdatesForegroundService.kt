@@ -119,6 +119,10 @@ class LocationUpdatesForegroundService : Service() {
                 addQueryParameter("token", token)
             }.build()
 
+            // Raw fix plus exactly what we send; token redacted since logs get shared.
+            FileLogger.i("Posting $location")
+            FileLogger.i("Sending ${url.newBuilder().setQueryParameter("token", "***").build().query}")
+
             val request = Request.Builder()
                 .url(url)
                 .get()
