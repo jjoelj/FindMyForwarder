@@ -4,6 +4,8 @@ import android.Manifest
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.location.Location
+import android.os.Build
 import android.os.IBinder
 import android.os.Looper
 import androidx.annotation.RequiresPermission
@@ -70,14 +72,14 @@ class LocationUpdatesForegroundService : Service() {
                     rememberLastSentLocation(location.latitude, location.longitude)
 
                     serviceScope.launch {
-                        postLocation(location.latitude, location.longitude)
+                        postLocation(location)
                     }
                 }
             }
         }
     }
 
-    suspend fun postLocation(latitude: Double, longitude: Double): Boolean =
+    suspend fun postLocation(location: Location): Boolean =
         withContext(Dispatchers.IO) {
             val baseUrl = prefs.forwardUrl
             val token = prefs.forwardToken
@@ -94,11 +96,28 @@ class LocationUpdatesForegroundService : Service() {
                 return@withContext false
             }
 
-            val url = httpUrl.newBuilder()
-                .addQueryParameter("lat", latitude.toString())
-                .addQueryParameter("lon", longitude.toString())
-                .addQueryParameter("token", token)
-                .build()
+            val url = httpUrl.newBuilder().apply {
+                addQueryParameter("lat", location.latitude.toString())
+                addQueryParameter("lon", location.longitude.toString())
+                // Optional fields are omitted when the fix doesn't carry them.
+                fun opt(name: String, has: Boolean, value: Number) {
+                    if (has) addQueryParameter(name, value.toString())
+                }
+                // A 0 m accuracy is a bogus reading, not a perfect one; omit it.
+                opt("acc", location.hasAccuracy() && location.accuracy > 0, location.accuracy)
+                if (Build.VERSION.SDK_INT >= 34 && location.hasMslAltitude()) {
+                    opt("alt", true, location.mslAltitudeMeters)
+                    opt("vacc", location.hasMslAltitudeAccuracy() && location.mslAltitudeAccuracyMeters > 0, location.mslAltitudeAccuracyMeters)
+                } else {
+                    opt("alt", location.hasAltitude(), location.altitude)
+                    opt("vacc", location.hasVerticalAccuracy() && location.verticalAccuracyMeters > 0, location.verticalAccuracyMeters)
+                }
+                opt("speed", location.hasSpeed(), location.speed)
+                opt("sacc", location.hasSpeedAccuracy(), location.speedAccuracyMetersPerSecond)
+                opt("course", location.hasBearing(), location.bearing)
+                opt("cacc", location.hasBearingAccuracy(), location.bearingAccuracyDegrees)
+                addQueryParameter("token", token)
+            }.build()
 
             val request = Request.Builder()
                 .url(url)
@@ -278,7 +297,7 @@ class LocationUpdatesForegroundService : Service() {
                 if (location != null) {
                     rememberLastSentLocation(location.latitude, location.longitude)
                     serviceScope.launch {
-                        postLocation(location.latitude, location.longitude)
+                        postLocation(location)
                     }
                 } else {
                     FileLogger.w("Current location is null.")
