@@ -109,6 +109,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -412,6 +415,39 @@ private val friendsStreamClient = friendsClient.newBuilder()
     .callTimeout(0, TimeUnit.SECONDS)
     .build()
 
+/** Latest friends pushed by /friends/stream, kept open app-wide while the app is visible. */
+object FriendsStream {
+    private val _latest = MutableStateFlow<List<Friend>?>(null)
+    val latest: StateFlow<List<Friend>?> = _latest
+
+    /** Runs until cancelled. On a drop, catches up with one fetch and reconnects. */
+    // ponytail: fixed retry delay; add backoff if a dead server makes this noisy.
+    suspend fun run(context: Context) {
+        val prefs = SharedPreferencesProvider(context)
+        while (true) {
+            // Re-read each pass: scanning the QR code configures the endpoint mid-session.
+            if (prefs.forwardUrl.isNotBlank() && prefs.forwardToken.isNotBlank()) {
+                try {
+                    streamFriends(context) { _latest.value = it }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    FileLogger.w("Friends stream dropped: ${e.message}")
+                }
+            }
+            delay(FRIENDS_STREAM_RETRY_MILLIS.milliseconds)
+            if (prefs.forwardUrl.isBlank() || prefs.forwardToken.isBlank()) continue
+            try {
+                _latest.value = fetchFriends(context)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                FileLogger.w("Friends catch-up fetch failed: ${e.message}")
+            }
+        }
+    }
+}
+
 /** Listens to /friends/stream (SSE) until the connection drops or the caller is cancelled. */
 suspend fun streamFriends(context: Context, onFriends: (List<Friend>) -> Unit): Unit = coroutineScope {
     val prefs = SharedPreferencesProvider(context)
@@ -593,6 +629,11 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         loadFriends(forceRefresh = true)
     }
 
+    // The stream itself runs app-wide (MainActivity), so switching tabs doesn't drop it.
+    LaunchedEffect(Unit) {
+        FriendsStream.latest.filterNotNull().collect { applyFetchedFriends(it) }
+    }
+
     // Poll only while this screen is actually visible; leaving the tab cancels the
     // effect and backgrounding the app suspends it via repeatOnLifecycle.
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -604,30 +645,9 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                 delay(FRIENDS_AUTO_REFRESH_DELAY_MILLIS.milliseconds)
                 if (!refreshedThisVisit) refresh()
             }
-            launch {
-                while (isActive) {
-                    delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS.milliseconds)
-                    Following.refresh(context)
-                }
-            }
-            // Server pushes friend changes; on a drop, catch up with one fetch and reconnect.
-            // ponytail: fixed retry delay; add backoff if a dead server makes this noisy.
             while (isActive) {
-                try {
-                    streamFriends(context, ::applyFetchedFriends)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    FileLogger.w("Friends stream dropped: ${e.message}")
-                }
-                delay(FRIENDS_STREAM_RETRY_MILLIS.milliseconds)
-                try {
-                    applyFetchedFriends(fetchFriends(context))
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    FileLogger.w("Friends catch-up fetch failed: ${e.message}")
-                }
+                delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS.milliseconds)
+                Following.refresh(context)
             }
         }
     }

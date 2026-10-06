@@ -67,7 +67,11 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import io.github.jjoelj.findmyforwarder.ui.theme.FindMyForwarderTheme
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
@@ -79,6 +83,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Activity-wide, not per-tab: the friends stream survives navigating within the app.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) { FriendsStream.run(this@MainActivity) }
+        }
 
         setContent {
             val themeMode by AppStatus.themeMode.collectAsState()
