@@ -104,7 +104,8 @@ class LocationUpdatesForegroundService : Service() {
                     if (has) addQueryParameter(name, value.toString())
                 }
                 // A 0 m accuracy is a bogus reading, not a perfect one; omit it.
-                opt("acc", location.hasAccuracy() && location.accuracy > 0, location.accuracy)
+                val acc = if (location.accuracy == 100f) 50f else location.accuracy
+                opt("acc", location.hasAccuracy() && acc > 0, acc)
                 if (Build.VERSION.SDK_INT >= 34 && location.hasMslAltitude()) {
                     opt("alt", true, location.mslAltitudeMeters)
                     opt("vacc", location.hasMslAltitudeAccuracy() && location.mslAltitudeAccuracyMeters > 0, location.mslAltitudeAccuracyMeters)
@@ -294,7 +295,8 @@ class LocationUpdatesForegroundService : Service() {
     @RequiresPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
     private fun sendCurrentLocation() {
         val currentLocationRequest = CurrentLocationRequest.Builder()
-            .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
+            .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+            .setMaxUpdateAgeMillis(0)
             .build()
         fusedLocationProviderClient.getCurrentLocation(currentLocationRequest, null)
             .addOnSuccessListener { location ->
