@@ -9,6 +9,17 @@ import java.io.IOException
 
 class FriendsTest {
     @Test
+    fun parsesSseData() {
+        val lines = sequenceOf(
+            ": keepalive", "",
+            "event: friends", "data: {\"a\":1}", "",
+            "data:{\"b\":", "data: 2}", "",
+            "data: trailing-without-blank-line",
+        )
+        assertEquals(listOf("{\"a\":1}", "{\"b\":\n2}"), sseData(lines).toList())
+    }
+
+    @Test
     fun normalizesHandles() {
         assertEquals("+12025550143", normalizeHandle("+1202555-0143"))
         assertEquals("2025550143", normalizeHandle("202 555 0143"))

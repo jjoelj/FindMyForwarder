@@ -104,7 +104,10 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -184,6 +187,7 @@ private const val MY_LOCATION_ARROW_GAP = 6f
 private const val SHEET_FLING_VELOCITY_THRESHOLD = 900f
 private const val FRIENDS_LIST_POLL_INTERVAL_MILLIS = 60_000L
 private const val FRIENDS_AUTO_REFRESH_DELAY_MILLIS = 10_000L
+private const val FRIENDS_STREAM_RETRY_MILLIS = 15_000L
 private const val ACTIVE_FRIEND_FETCH_INTERVAL_MILLIS = 15_000L
 
 data class Friend(
@@ -380,17 +384,72 @@ suspend fun fetchFriends(context: Context, handle: String? = null): List<Friend>
             response.code == 403 -> throw IOException("Token rejected — scan the QR code again")
             !response.isSuccessful -> throw IOException("HTTP ${response.code}")
         }
-        val body = response.body.string()
-        val friends = parseFriends(body)
-        if (handle == null) {
-            prefs.friendsCache = body
-            prefs.lastFriendsUpdatedAtMillis = System.currentTimeMillis()
-            MapWidget.requestUpdate(context)
+        acceptFriendsBody(context, prefs, response.body.string(), cache = handle == null)
+    }
+}
+
+private fun acceptFriendsBody(
+    context: Context,
+    prefs: SharedPreferencesProvider,
+    body: String,
+    cache: Boolean,
+): List<Friend> {
+    val friends = parseFriends(body)
+    if (cache) {
+        prefs.friendsCache = body
+        prefs.lastFriendsUpdatedAtMillis = System.currentTimeMillis()
+        MapWidget.requestUpdate(context)
+    }
+    FileLogger.i(
+        "Fetched ${friends.size} friends (${friends.count { it.hasLocation }} with location)"
+    )
+    return resolveAndDedupe(context, friends)
+}
+
+// The stream stays open indefinitely, so no read/call timeout.
+private val friendsStreamClient = friendsClient.newBuilder()
+    .readTimeout(0, TimeUnit.SECONDS)
+    .callTimeout(0, TimeUnit.SECONDS)
+    .build()
+
+/** Listens to /friends/stream (SSE) until the connection drops or the caller is cancelled. */
+suspend fun streamFriends(context: Context, onFriends: (List<Friend>) -> Unit): Unit = coroutineScope {
+    val prefs = SharedPreferencesProvider(context)
+    val url = friendsUrl(prefs, "/friends/stream")
+        ?: throw IOException("Invalid base URL; check Settings")
+    val call = friendsStreamClient.newCall(Request.Builder().url(url).get().build())
+    // Blocking reads ignore coroutine cancellation; cancelling the call unblocks them.
+    val canceller = launch { try { awaitCancellation() } finally { call.cancel() } }
+    try {
+        withContext(Dispatchers.IO) {
+            call.execute().use { response ->
+                when {
+                    response.code == 403 -> throw IOException("Token rejected — scan the QR code again")
+                    !response.isSuccessful -> throw IOException("HTTP ${response.code}")
+                }
+                val source = response.body.source()
+                sseData(generateSequence { source.readUtf8Line() }).forEach { body ->
+                    val friends = acceptFriendsBody(context, prefs, body, cache = true)
+                    withContext(Dispatchers.Main) { onFriends(friends) }
+                }
+            }
         }
-        FileLogger.i(
-            "Fetched ${friends.size} friends (${friends.count { it.hasLocation }} with location)"
-        )
-        resolveAndDedupe(context, friends)
+    } finally {
+        canceller.cancel()
+    }
+}
+
+/** The `data:` payload of each server-sent event; ignores comments, ids and event names. */
+internal fun sseData(lines: Sequence<String>): Sequence<String> = sequence {
+    val data = mutableListOf<String>()
+    for (line in lines) {
+        when {
+            line.startsWith("data:") -> data += line.removePrefix("data:").removePrefix(" ")
+            line.isEmpty() && data.isNotEmpty() -> {
+                yield(data.joinToString("\n"))
+                data.clear()
+            }
+        }
     }
 }
 
@@ -545,14 +604,29 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
                 delay(FRIENDS_AUTO_REFRESH_DELAY_MILLIS.milliseconds)
                 if (!refreshedThisVisit) refresh()
             }
+            launch {
+                while (isActive) {
+                    delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS.milliseconds)
+                    Following.refresh(context)
+                }
+            }
+            // Server pushes friend changes; on a drop, catch up with one fetch and reconnect.
+            // ponytail: fixed retry delay; add backoff if a dead server makes this noisy.
             while (isActive) {
-                delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS.milliseconds)
-                if (loading) continue
-                Following.refresh(context)
+                try {
+                    streamFriends(context, ::applyFetchedFriends)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    FileLogger.w("Friends stream dropped: ${e.message}")
+                }
+                delay(FRIENDS_STREAM_RETRY_MILLIS.milliseconds)
                 try {
                     applyFetchedFriends(fetchFriends(context))
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    FileLogger.w("Friends list poll failed: ${e.message}")
+                    FileLogger.w("Friends catch-up fetch failed: ${e.message}")
                 }
             }
         }
