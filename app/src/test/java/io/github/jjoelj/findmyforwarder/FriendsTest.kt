@@ -9,6 +9,14 @@ import java.io.IOException
 
 class FriendsTest {
     @Test
+    fun prefersPhonesWhenSharing() {
+        assertEquals(listOf("+1 202"), preferredHandles(listOf("a@b.com", "+1 202")))
+        assertEquals(listOf("1", "2"), preferredHandles(listOf("1", "a@b.com", "2")))
+        assertEquals(listOf("a@b.com", "c@d.com"), preferredHandles(listOf("a@b.com", "c@d.com")))
+        assertEquals(emptyList<String>(), preferredHandles(emptyList()))
+    }
+
+    @Test
     fun parsesSseData() {
         val lines = sequenceOf(
             ": keepalive", "",

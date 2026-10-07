@@ -19,6 +19,7 @@ import android.os.SystemClock
 import android.view.MotionEvent
 import android.net.Uri
 import android.provider.ContactsContract
+import android.telephony.PhoneNumberUtils
 import android.text.format.DateUtils
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -126,6 +127,7 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Overlay
 import org.json.JSONObject
 import java.io.IOException
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.absoluteValue
 import kotlin.time.Duration.Companion.milliseconds
@@ -209,10 +211,17 @@ data class Friend(
     val hasLocation get() = valid && lat != null && lon != null
 
     /** Every handle this person answers to. Find My shares per handle, not per person. */
-    val handles get() = (listOf(handle) + aliases).distinct()
+    val handles get() = (listOf(handle) + aliases).distinctBy { normalizeHandle(it) }
 }
 
 /** Phone handles keep a leading + and digits only; emails compare lowercased. */
+/**
+ * Contacts often store "(202) 555-0143"; Find My and the server use "+12025550143". Adds the
+ * country code from the device locale so the two compare equal; leaves anything unparseable.
+ */
+internal fun toE164(number: String): String =
+    PhoneNumberUtils.formatNumberToE164(number.trim(), Locale.getDefault().country) ?: number.trim()
+
 fun normalizeHandle(handle: String): String {
     val t = handle.trim()
     return if ("@" in t) t.lowercase()
@@ -262,7 +271,12 @@ fun dedupeFriends(friends: List<Friend>): List<Friend> =
         }
         .sortedBy { (it.name ?: it.handle).lowercase() }
 
-internal data class ContactInfo(val name: String?, val photoUri: String?)
+internal data class ContactInfo(
+    val name: String?,
+    val photoUri: String?,
+    /** The server resolves phones to Apple IDs, so these become shareable aliases. */
+    val phones: List<String> = emptyList(),
+)
 
 internal fun resolveContact(context: Context, handle: String): ContactInfo = try {
     val n = normalizeHandle(handle)
@@ -286,8 +300,9 @@ internal fun resolveContact(context: Context, handle: String): ContactInfo = try
         null, null, null
     )?.use { c ->
         if (c.moveToFirst()) {
-            val nickname = contactNickname(context, c.getLong(0))
-            ContactInfo(nickname ?: c.getString(1), c.getString(2))
+            val contactId = c.getLong(0)
+            val nickname = contactNickname(context, contactId)
+            ContactInfo(nickname ?: c.getString(1), c.getString(2), contactPhones(context, contactId))
         } else ContactInfo(null, null)
     } ?: ContactInfo(null, null)
 } catch (e: Exception) {
@@ -308,6 +323,19 @@ private fun contactNickname(context: Context, contactId: Long): String? =
     )?.use { c ->
         if (c.moveToFirst()) c.getString(0)?.takeIf { it.isNotBlank() } else null
     }
+
+private fun contactPhones(context: Context, contactId: Long): List<String> =
+    context.contentResolver.query(
+        ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+        arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+        "${ContactsContract.CommonDataKinds.Phone.CONTACT_ID}=?",
+        arrayOf(contactId.toString()),
+        null
+    )?.use { c ->
+        buildList {
+            while (c.moveToNext()) c.getString(0)?.takeIf { it.isNotBlank() }?.let { add(toE164(it)) }
+        }
+    }.orEmpty()
 
 fun relativeTime(epochSeconds: Long, nowMillis: Long = System.currentTimeMillis()): String {
     val atMillis = epochSeconds * 1000
@@ -543,7 +571,7 @@ private fun resolveAndDedupe(context: Context, friends: List<Friend>): List<Frie
     val named = if (canReadContacts) {
         friends.map {
             val info = resolveContact(context, it.handle)
-            it.copy(name = info.name, photoUri = info.photoUri)
+            it.copy(name = info.name, photoUri = info.photoUri, aliases = it.aliases + info.phones)
         }
     } else friends
     return dedupeFriends(named)

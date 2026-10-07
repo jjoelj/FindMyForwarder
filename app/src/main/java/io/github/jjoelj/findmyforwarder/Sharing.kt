@@ -133,19 +133,14 @@ suspend fun setSharing(context: Context, handle: String, share: Boolean) =
     following(context, if (share) "/share" else "/unshare", handle)
 
 /**
- * Turns sharing on or off for a person rather than an alias, and returns the follower list
- * the iPhone reports afterwards. Stopping means stopping every alias they answer to —
+ * Stops sharing with a person rather than an alias, and returns the follower list the
+ * iPhone reports afterwards. Stopping means stopping every alias they answer to —
  * leaving one on is exactly the "I unshared but Find My still shows sharing" case.
  */
-suspend fun setPersonSharing(
-    context: Context,
-    friend: Friend,
-    share: Boolean,
-    known: List<String>,
-): List<String> {
-    if (share) return setSharing(context, friend.handle, true)
+suspend fun unsharePerson(context: Context, friend: Friend, known: List<String>): List<String> {
     var result = known
-    for (handle in friend.handles.filter { result.hasHandle(it) }) {
+    // Unshare with the server's spelling (bare +digits), not the contact's formatted one.
+    for (handle in known.filter { listed -> friend.handles.any { normalizeHandle(it) == normalizeHandle(listed) } }) {
         result = setSharing(context, handle, false)
     }
     return result
@@ -178,15 +173,20 @@ suspend fun followerOnlyFriends(
             valid = false,
             name = info.name,
             photoUri = info.photoUri,
+            aliases = info.phones,
             followsMe = true,
         )
     }
 }
 
 /**
- * Every email and phone on a picked contact. Find My keys off one specific alias and only
- * the user knows which one is their Apple ID, so offer all of them rather than guessing.
+ * The server resolves any phone number to the right Apple ID, so phones win outright;
+ * emails only matter when the contact has no phone. More than one left means asking.
  */
+internal fun preferredHandles(handles: List<String>): List<String> =
+    handles.filter { "@" !in it }.ifEmpty { handles }
+
+/** Every email and phone on a picked contact. */
 private suspend fun contactHandles(context: Context, contactUri: Uri): List<String> =
     withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
@@ -207,7 +207,7 @@ private suspend fun contactHandles(context: Context, contactUri: Uri): List<Stri
         )?.use { c ->
             buildList {
                 while (c.moveToNext()) {
-                    c.getString(0)?.takeIf { it.isNotBlank() }?.let { add(it.trim()) }
+                    c.getString(0)?.takeIf { it.isNotBlank() }?.let { add(if ("@" in it) it.trim() else toE164(it)) }
                 }
             }
         }.orEmpty().distinctBy { normalizeHandle(it) }
@@ -222,6 +222,53 @@ fun SharingToggle(friend: Friend, modifier: Modifier = Modifier) {
     val unsupported by Following.unsupported.collectAsState()
     var busy by remember(friend.handle) { mutableStateOf(false) }
     var error by remember(friend.handle) { mutableStateOf<String?>(null) }
+    var choices by remember(friend.handle) { mutableStateOf<List<String>?>(null) }
+
+    // shareTo null means stop sharing with every alias.
+    fun change(shareTo: String?) {
+        busy = true
+        error = null
+        choices = null
+        scope.launch {
+            try {
+                val now = if (shareTo != null) setSharing(context, shareTo, true)
+                else unsharePerson(context, friend, known.orEmpty())
+                Following.set(now)
+                // A 200 doesn't mean fmfd agreed; the returned list is what did.
+                if (friend.handles.any { now.hasHandle(it) } != (shareTo != null)) {
+                    error = if (shareTo != null) "Find My didn't start sharing"
+                    else "Find My still shows sharing"
+                }
+            } catch (e: Exception) {
+                error = e.message ?: "Couldn't change sharing"
+                FileLogger.e("Sharing change failed for ${friend.handle}: ${e.message}")
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    choices?.let { options ->
+        AlertDialog(
+            onDismissRequest = { choices = null },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { choices = null }) { Text("Cancel") } },
+            title = { Text(if (options.all { "@" in it }) "Which email?" else "Which number?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    options.forEach { handle ->
+                        Text(
+                            text = handle,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { change(handle) }
+                                .padding(vertical = 10.dp)
+                        )
+                    }
+                }
+            }
+        )
+    }
 
     if (unsupported) {
         Text(
@@ -260,24 +307,10 @@ fun SharingToggle(friend: Friend, modifier: Modifier = Modifier) {
                 checked = sharingWith.isNotEmpty(),
                 enabled = known != null && !busy,
                 onCheckedChange = { want ->
-                    busy = true
-                    error = null
-                    scope.launch {
-                        try {
-                            val now = setPersonSharing(context, friend, want, known.orEmpty())
-                            Following.set(now)
-                            // A 200 doesn't mean fmfd agreed; the returned list is what did.
-                            if (friend.handles.any { now.hasHandle(it) } != want) {
-                                error = if (want) "Find My didn't start sharing"
-                                else "Find My still shows sharing"
-                            }
-                        } catch (e: Exception) {
-                            error = e.message ?: "Couldn't change sharing"
-                            FileLogger.e("Sharing change failed for ${friend.handle}: ${e.message}")
-                        } finally {
-                            busy = false
-                        }
-                    }
+                    if (!want) return@Switch change(null)
+                    // Phones over emails; with several left, the user picks — never guess.
+                    val options = preferredHandles(friend.handles)
+                    if (options.size == 1) change(options.first()) else choices = options
                 }
             )
         }
@@ -333,10 +366,12 @@ fun AddSharingFlow(onDone: () -> Unit) {
             return@rememberLauncherForActivityResult
         }
         scope.launch {
-            when (val handles = contactHandles(context, uri)) {
+            val handles = preferredHandles(contactHandles(context, uri))
+            when (handles.size) {
                 // A contact with no email or phone can't be an Apple ID; let them type one.
-                emptyList<String>() -> typed = ""
-                else -> if (handles.size == 1) share(handles.first()) else choices = handles
+                0 -> typed = ""
+                1 -> share(handles.first())
+                else -> choices = handles
             }
         }
     }
