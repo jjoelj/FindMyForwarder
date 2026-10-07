@@ -32,6 +32,8 @@ class LocationUpdatesForegroundService : Service() {
     private lateinit var fusedLocationProviderClient: FusedLocationProviderClient
     private lateinit var notificationProvider: NotificationProvider
     private lateinit var locationCallback: LocationCallback
+    private lateinit var gpsCallback: LocationCallback
+    private lateinit var passiveCallback: LocationCallback
     private lateinit var prefs: SharedPreferencesProvider
 
     private val client = OkHttpClient()
@@ -42,6 +44,7 @@ class LocationUpdatesForegroundService : Service() {
         const val RESET_LOCATION_ACTION = "RESET_LOCATION_ACTION"
         const val EXTRA_ACTIVITY_TYPE = "EXTRA_ACTIVITY_TYPE"
         const val EXTRA_TRANSITION_TYPE = "EXTRA_TRANSITION_TYPE"
+        private const val GPS_INTERVAL_MILLIS = 5 * 60_000L
 
         @Volatile
         private var isServiceInForeground = false
@@ -65,16 +68,26 @@ class LocationUpdatesForegroundService : Service() {
         // acked registration, so the sticky-restart case is covered without extra cost.
         startActivityRecognition(applicationContext)
 
-        locationCallback = object : LocationCallback() {
-            override fun onLocationResult(locationResult: LocationResult) {
-                locationResult.lastLocation?.let { location ->
-                    FileLogger.i("Location update received: ${location.latitude}, ${location.longitude}")
-                    rememberLastSentLocation(location.latitude, location.longitude)
+        locationCallback = fixCallback(onlyPrecise = false)
+        gpsCallback = fixCallback(onlyPrecise = false)
+        passiveCallback = fixCallback(onlyPrecise = true)
+    }
 
-                    serviceScope.launch {
-                        postLocation(location)
-                    }
-                }
+    // One fix can reach several callbacks (passive sees ours too); post it once.
+    private var lastFixNanos = 0L
+
+    /** onlyPrecise: drop the flat-100 m balanced fixes; passive only adds value with real GPS. */
+    private fun fixCallback(onlyPrecise: Boolean) = object : LocationCallback() {
+        override fun onLocationResult(locationResult: LocationResult) {
+            val location = locationResult.lastLocation ?: return
+            if (location.elapsedRealtimeNanos <= lastFixNanos) return
+            if (onlyPrecise && !(location.hasAccuracy() && location.accuracy < 100f)) return
+            lastFixNanos = location.elapsedRealtimeNanos
+            FileLogger.i("Location update received: ${location.latitude}, ${location.longitude}")
+            rememberLastSentLocation(location.latitude, location.longitude)
+
+            serviceScope.launch {
+                postLocation(location)
             }
         }
     }
@@ -104,7 +117,10 @@ class LocationUpdatesForegroundService : Service() {
                     if (has) addQueryParameter(name, value.toString())
                 }
                 // A 0 m accuracy is a bogus reading, not a perfect one; omit it.
-                opt("acc", location.hasAccuracy() && location.accuracy > 0, location.accuracy)
+                // Balanced fused fixes report a flat 100 m that's really much tighter (the pin
+                // sits on us); 100 makes Find My draw a useless circle, so send 50 instead.
+                val acc = if (location.accuracy == 100f) 50f else location.accuracy
+                opt("acc", location.hasAccuracy() && acc > 0, acc)
                 if (Build.VERSION.SDK_INT >= 34 && location.hasMslAltitude()) {
                     opt("alt", true, location.mslAltitudeMeters)
                     opt("vacc", location.hasMslAltitudeAccuracy() && location.mslAltitudeAccuracyMeters > 0, location.mslAltitudeAccuracyMeters)
@@ -184,6 +200,17 @@ class LocationUpdatesForegroundService : Service() {
             isServiceInForeground = true
             AppStatus.setServiceRunning(true)
             FileLogger.i("LocationUpdatesForegroundService started in foreground.")
+            // Free: never powers anything, just hears fixes other apps (Maps, etc.) pay for.
+            fusedLocationProviderClient.requestLocationUpdates(
+                LocationRequest.Builder(Priority.PRIORITY_PASSIVE, 60_000L)
+                    .setMinUpdateIntervalMillis(60_000L)
+                    .setMinUpdateDistanceMeters(15f)
+                    .build(),
+                passiveCallback,
+                Looper.getMainLooper()
+            ).addOnFailureListener {
+                FileLogger.e("Failed to start passive location updates: ${it.message}")
+            }
         }
 
         when (intent?.action) {
@@ -191,7 +218,7 @@ class LocationUpdatesForegroundService : Service() {
 
             RESET_LOCATION_ACTION -> {
                 FileLogger.i("Received RESET_LOCATION_ACTION")
-                sendCurrentLocation()
+                sendCurrentLocation(highAccuracy = true)
             }
         }
         // STICKY now that idling in the foreground is the resting state: a null-intent
@@ -240,6 +267,21 @@ class LocationUpdatesForegroundService : Service() {
                 AppStatus.setLocationUpdatesActive(false)
             }.addOnSuccessListener {
                 AppStatus.setLocationUpdatesActive(true)
+            }
+            // Balanced fixes report a flat 100 m. One real GPS fix every 5 min, only when moving
+            // fast enough for that to matter; on foot, balanced is close enough.
+            val fast = activityType == DetectedActivity.IN_VEHICLE ||
+                activityType == DetectedActivity.ON_BICYCLE
+            // Vehicle -> walking can deliver ENTER before the vehicle EXIT; don't leave GPS on.
+            if (!fast) fusedLocationProviderClient.removeLocationUpdates(gpsCallback)
+            else fusedLocationProviderClient.requestLocationUpdates(
+                LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, GPS_INTERVAL_MILLIS)
+                    .setMinUpdateIntervalMillis(GPS_INTERVAL_MILLIS)
+                    .build(),
+                gpsCallback,
+                Looper.getMainLooper()
+            ).addOnFailureListener {
+                FileLogger.e("Failed to start GPS location updates: ${it.message}")
             }
         } else if (transitionType == ActivityTransition.ACTIVITY_TRANSITION_EXIT) {
             stopLocationUpdates()
@@ -292,9 +334,15 @@ class LocationUpdatesForegroundService : Service() {
     }
 
     @RequiresPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
-    private fun sendCurrentLocation() {
+    private fun sendCurrentLocation(highAccuracy: Boolean = false) {
+        // A user-requested send gets a fresh GPS fix; the automatic one on going still stays
+        // cheap. A cached fix would just be the last balanced one.
         val currentLocationRequest = CurrentLocationRequest.Builder()
-            .setPriority(Priority.PRIORITY_BALANCED_POWER_ACCURACY)
+            .setPriority(
+                if (highAccuracy) Priority.PRIORITY_HIGH_ACCURACY
+                else Priority.PRIORITY_BALANCED_POWER_ACCURACY
+            )
+            .apply { if (highAccuracy) setMaxUpdateAgeMillis(0) }
             .build()
         fusedLocationProviderClient.getCurrentLocation(currentLocationRequest, null)
             .addOnSuccessListener { location ->
@@ -313,6 +361,7 @@ class LocationUpdatesForegroundService : Service() {
     }
 
     private fun stopLocationUpdates() {
+        fusedLocationProviderClient.removeLocationUpdates(gpsCallback)
         fusedLocationProviderClient.removeLocationUpdates(locationCallback).addOnFailureListener {
             FileLogger.e("Failed to stop location updates: ${it.message}")
         }.addOnSuccessListener {
@@ -323,6 +372,8 @@ class LocationUpdatesForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        fusedLocationProviderClient.removeLocationUpdates(passiveCallback)
+        fusedLocationProviderClient.removeLocationUpdates(gpsCallback)
         client.dispatcher.executorService.shutdown()
     }
 }
