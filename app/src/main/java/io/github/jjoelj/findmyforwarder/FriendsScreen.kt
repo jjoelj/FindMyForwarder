@@ -106,7 +106,11 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.withTimeout
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -191,9 +195,7 @@ private const val MY_LOCATION_DOT_RATIO = 20f / 28f
 private const val MY_LOCATION_ARROW_GAP = 6f
 private const val SHEET_FLING_VELOCITY_THRESHOLD = 900f
 private const val FRIENDS_LIST_POLL_INTERVAL_MILLIS = 60_000L
-private const val FRIENDS_AUTO_REFRESH_DELAY_MILLIS = 10_000L
 private const val FRIENDS_STREAM_RETRY_MILLIS = 15_000L
-private const val ACTIVE_FRIEND_FETCH_INTERVAL_MILLIS = 15_000L
 
 data class Friend(
     val handle: String,
@@ -362,14 +364,12 @@ fun formatMiles(from: Location, lat: Double, lon: Double): String {
 }
 
 // The iPhone refreshes its cache independently; /friends returns the latest server cache.
+// The first /friends after a phone or server restart takes ~3–6 s while the server reads
+// Messages' cached locations, and /friends/refresh up to ~43 s (40 s wait + waking Messages).
+// One generous client covers both.
 internal val friendsClient = OkHttpClient.Builder()
-    .readTimeout(25, TimeUnit.SECONDS)
-    .callTimeout(30, TimeUnit.SECONDS)
-    .build()
-
-private val friendsRefreshClient = OkHttpClient.Builder()
-    .readTimeout(45, TimeUnit.SECONDS)
-    .callTimeout(50, TimeUnit.SECONDS)
+    .readTimeout(60, TimeUnit.SECONDS)
+    .callTimeout(60, TimeUnit.SECONDS)
     .build()
 
 internal fun friendsUrl(
@@ -437,9 +437,10 @@ private fun acceptFriendsBody(
     return resolveAndDedupe(context, friends)
 }
 
-// The stream stays open indefinitely, so no read/call timeout.
+// The stream stays open indefinitely, so no call timeout. The server sends `: hb` after
+// 15 s without a change, so 45 s of silence means the connection is dead.
 private val friendsStreamClient = friendsClient.newBuilder()
-    .readTimeout(0, TimeUnit.SECONDS)
+    .readTimeout(45, TimeUnit.SECONDS)
     .callTimeout(0, TimeUnit.SECONDS)
     .build()
 
@@ -448,19 +449,47 @@ object FriendsStream {
     private val _latest = MutableStateFlow<List<Friend>?>(null)
     val latest: StateFlow<List<Friend>?> = _latest
 
+    /** True from the stream's first event until it drops. */
+    private val _live = MutableStateFlow(false)
+    val live: StateFlow<Boolean> = _live
+
+    // Completed = nothing pending. A new request reopens the stream.
+    private val refreshRequests = MutableStateFlow(CompletableDeferred(Unit))
+
+    /**
+     * The server refreshes every open stream on connect and every 30 s, so reopening it
+     * forces a refresh now. Returns once its first event (the cached list) lands; fixes
+     * arrive through [latest] as friends report in. Throws if the stream fails first.
+     */
+    suspend fun refresh() {
+        val request = CompletableDeferred<Unit>()
+        // Release an earlier caller; the new stream delivers for both.
+        refreshRequests.value.complete(Unit)
+        refreshRequests.value = request
+        request.await()
+    }
+
     /** Runs until cancelled. On a drop, catches up with one fetch and reconnects. */
     // ponytail: fixed retry delay; add backoff if a dead server makes this noisy.
     suspend fun run(context: Context) {
         val prefs = SharedPreferencesProvider(context)
-        while (true) {
+        // collectLatest drops the current connection when a refresh is requested.
+        refreshRequests.collectLatest { request -> while (true) {
             // Re-read each pass: scanning the QR code configures the endpoint mid-session.
             if (prefs.forwardUrl.isNotBlank() && prefs.forwardToken.isNotBlank()) {
                 try {
-                    streamFriends(context) { _latest.value = it }
+                    streamFriends(context) {
+                        _latest.value = it
+                        _live.value = true
+                        request.complete(Unit)
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     FileLogger.w("Friends stream dropped: ${e.message}")
+                    request.completeExceptionally(e)
+                } finally {
+                    _live.value = false
                 }
             }
             delay(FRIENDS_STREAM_RETRY_MILLIS.milliseconds)
@@ -472,14 +501,22 @@ object FriendsStream {
             } catch (e: Exception) {
                 FileLogger.w("Friends catch-up fetch failed: ${e.message}")
             }
-        }
+        } }
     }
 }
 
-/** Listens to /friends/stream (SSE) until the connection drops or the caller is cancelled. */
-suspend fun streamFriends(context: Context, onFriends: (List<Friend>) -> Unit): Unit = coroutineScope {
+/**
+ * Listens to /friends/stream (SSE) until the connection drops or the caller is cancelled.
+ * While it's open the server refreshes locations itself: every 30 s for everyone, or every
+ * 15 s for just [handle].
+ */
+suspend fun streamFriends(
+    context: Context,
+    handle: String? = null,
+    onFriends: (List<Friend>) -> Unit,
+): Unit = coroutineScope {
     val prefs = SharedPreferencesProvider(context)
-    val url = friendsUrl(prefs, "/friends/stream")
+    val url = friendsUrl(prefs, "/friends/stream", handle)
         ?: throw IOException("Invalid base URL; check Settings")
     val call = friendsStreamClient.newCall(Request.Builder().url(url).get().build())
     // Blocking reads ignore coroutine cancellation; cancelling the call unblocks them.
@@ -493,7 +530,8 @@ suspend fun streamFriends(context: Context, onFriends: (List<Friend>) -> Unit): 
                 }
                 val source = response.body.source()
                 sseData(generateSequence { source.readUtf8Line() }).forEach { body ->
-                    val friends = acceptFriendsBody(context, prefs, body, cache = true)
+                    // A single-friend stream mustn't overwrite the full-list cache.
+                    val friends = acceptFriendsBody(context, prefs, body, cache = handle == null)
                     withContext(Dispatchers.Main) { onFriends(friends) }
                 }
             }
@@ -528,12 +566,9 @@ suspend fun refreshFriends(context: Context, handle: String? = null): List<Frien
         .get()
         .build()
 
-    friendsRefreshClient.newCall(request).execute().use { response ->
+    // Overlapping refreshes join the running one server-side, so there's no 409 to retry.
+    friendsClient.newCall(request).execute().use { response ->
         if (response.code == 403) throw IOException("Token rejected — scan the QR code again")
-        if (response.code == 409) {
-            FileLogger.i("Friends location refresh already in progress")
-            return@withContext emptyList()
-        }
         if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
 
         val body = response.body.string()
@@ -593,7 +628,6 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
     var mapSheetSnapRequest by remember { mutableStateOf(0) }
     var mapMyLocationRequest by remember { mutableStateOf(0) }
     var mapFitAllRequest by remember { mutableStateOf(0) }
-    var refreshedThisVisit by remember { mutableStateOf(false) }
     val refreshingHandles = remember { mutableStateMapOf<String, Boolean>() }
     val status by AppStatus.state.collectAsState()
     // Prefs hold the durable "last successful push" time; the status flow just
@@ -633,17 +667,13 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
 
     fun loadFriends(forceRefresh: Boolean) {
         if (!configured || loading) return
-        if (forceRefresh) refreshedThisVisit = true
         scope.launch {
             loading = true
             error = null
             try {
-                val fetchedFriends = if (forceRefresh) {
-                    refreshFriends(context).ifEmpty { fetchFriends(context) }
-                } else {
-                    fetchFriends(context)
-                }
-                applyFetchedFriends(fetchedFriends)
+                // Refresh results flow in through FriendsStream.latest, collected below.
+                if (forceRefresh) withTimeout(60.seconds) { FriendsStream.refresh() }
+                else applyFetchedFriends(fetchFriends(context))
             } catch (e: Exception) {
                 error = e.message ?: "Unknown error"
                 FileLogger.e("Failed to fetch friends: ${e.message}")
@@ -663,16 +693,13 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
     }
 
     // Poll only while this screen is actually visible; leaving the tab cancels the
-    // effect and backgrounding the app suspends it via repeatOnLifecycle.
+    // effect and backgrounding the app suspends it via repeatOnLifecycle. Locations need
+    // no timer: the open stream has the server refresh them every 30 s.
     val lifecycleOwner = LocalLifecycleOwner.current
     LaunchedEffect(configured, lifecycleOwner) {
         if (!configured) return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             launch { Following.refresh(context) }
-            launch {
-                delay(FRIENDS_AUTO_REFRESH_DELAY_MILLIS.milliseconds)
-                if (!refreshedThisVisit) refresh()
-            }
             while (isActive) {
                 delay(FRIENDS_LIST_POLL_INTERVAL_MILLIS.milliseconds)
                 Following.refresh(context)
@@ -823,52 +850,52 @@ fun FriendsScreen(modifier: Modifier = Modifier, resetRequest: Int = 0) {
         LaunchedEffect(selectedFriend?.handle) {
             val selectedHandle = selectedFriend?.handle ?: return@LaunchedEffect
             val normalizedHandle = normalizeHandle(selectedHandle)
+            // A stream for just this friend has the server refresh them every 15 s (vs
+            // 30 s for everyone) and pushes each fix as it lands.
             lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                 while (isActive) {
-                    val fetchStartedAt = System.currentTimeMillis()
                     refreshingHandles[selectedHandle] = true
                     try {
-                        val fetchedFriends = refreshFriends(context, handle = selectedHandle)
-                            .ifEmpty { fetchFriends(context, handle = selectedHandle) }
-                        fetchedFriends.firstOrNull { normalizeHandle(it.handle) == normalizedHandle }?.let { updated ->
-                            val current = selectedFriend
-                            if (current == null || normalizeHandle(current.handle) != normalizedHandle) {
-                                return@let
-                            }
-                            val updatedWithMetadata = updated.copy(
-                                name = updated.name ?: current.name,
-                                photoUri = updated.photoUri ?: current.photoUri,
-                            )
-                            if (updatedWithMetadata.lat != current.lat || updatedWithMetadata.lon != current.lon) {
-                                mapSelectionRequest++
-                            }
-                            selectedFriend = updatedWithMetadata
-                            var replaced = false
-                            friends = friends.map { friend ->
-                                if (normalizeHandle(friend.handle) != normalizedHandle) {
-                                    friend
-                                } else {
-                                    replaced = true
-                                    updatedWithMetadata.copy(
-                                        name = updatedWithMetadata.name ?: friend.name,
-                                        photoUri = updatedWithMetadata.photoUri ?: friend.photoUri,
-                                    )
+                        streamFriends(context, handle = selectedHandle) { fetchedFriends ->
+                            refreshingHandles.remove(selectedHandle)
+                            fetchedFriends.firstOrNull { normalizeHandle(it.handle) == normalizedHandle }?.let { updated ->
+                                val current = selectedFriend
+                                if (current == null || normalizeHandle(current.handle) != normalizedHandle) {
+                                    return@let
+                                }
+                                val updatedWithMetadata = updated.copy(
+                                    name = updated.name ?: current.name,
+                                    photoUri = updated.photoUri ?: current.photoUri,
+                                )
+                                if (updatedWithMetadata.lat != current.lat || updatedWithMetadata.lon != current.lon) {
+                                    mapSelectionRequest++
+                                }
+                                selectedFriend = updatedWithMetadata
+                                var replaced = false
+                                friends = friends.map { friend ->
+                                    if (normalizeHandle(friend.handle) != normalizedHandle) {
+                                        friend
+                                    } else {
+                                        replaced = true
+                                        updatedWithMetadata.copy(
+                                            name = updatedWithMetadata.name ?: friend.name,
+                                            photoUri = updatedWithMetadata.photoUri ?: friend.photoUri,
+                                        )
+                                    }
+                                }
+                                if (!replaced) {
+                                    friends = friends + updatedWithMetadata
                                 }
                             }
-                            if (!replaced) {
-                                friends = friends + updatedWithMetadata
-                            }
                         }
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
-                        FileLogger.w("Failed to update selected friend from cache: ${e.message}")
+                        FileLogger.w("Selected friend stream dropped: ${e.message}")
                     } finally {
                         refreshingHandles.remove(selectedHandle)
                     }
-                    val elapsedMillis = System.currentTimeMillis() - fetchStartedAt
-                    val remainingDelay = ACTIVE_FRIEND_FETCH_INTERVAL_MILLIS - elapsedMillis
-                    if (remainingDelay > 0) {
-                        delay(remainingDelay.milliseconds)
-                    }
+                    delay(FRIENDS_STREAM_RETRY_MILLIS.milliseconds)
                 }
             }
         }
@@ -2057,7 +2084,23 @@ private fun FriendsSheetHeader(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column {
-            Text("Friends", style = MaterialTheme.typography.titleLarge)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Friends", style = MaterialTheme.typography.titleLarge)
+                if (FriendsStream.live.collectAsState().value) {
+                    Spacer(Modifier.width(10.dp))
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .background(androidx.compose.ui.graphics.Color(0xFF34A853), CircleShape)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "Live",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
             lastPushedLabel(lastPushedAtMillis, rememberTimeTick())?.let {
                 Text(
                     text = it,
